@@ -275,9 +275,21 @@ mod tests {
         assert_eq!(f & (1 << 32), 0, "SupportsVolume must stay off");
         assert_eq!(f & (1 << 49), 0, "SupportsAirPlayVideoV2 must stay off");
         assert_eq!(f & (1 << 50), 0, "MetadataNowPlayingBplist must stay off");
-        assert_eq!(f & (1 << 52), 0, "SupportsSetPeersExtendedMessage must stay off");
-        assert_eq!(f & (1 << 59), 0, "SupportsAudioStreamConnectionSetup must stay off");
-        assert_eq!(f & (1 << 60), 0, "SupportsAudioMediaDataControl must stay off");
+        assert_eq!(
+            f & (1 << 52),
+            0,
+            "SupportsSetPeersExtendedMessage must stay off"
+        );
+        assert_eq!(
+            f & (1 << 59),
+            0,
+            "SupportsAudioStreamConnectionSetup must stay off"
+        );
+        assert_eq!(
+            f & (1 << 60),
+            0,
+            "SupportsAudioMediaDataControl must stay off"
+        );
         assert_eq!(f & (1 << 61), 0, "SupportsRfc2198Redundancy must stay off");
     }
 
@@ -285,7 +297,11 @@ mod tests {
     #[cfg(not(feature = "video"))]
     fn default_pairing_keeps_transient_bit() {
         let f = receiver_features_for_pairing(false);
-        assert_ne!(f & (1 << 47), 0, "transient pairing bit must be on by default");
+        assert_ne!(
+            f & (1 << 47),
+            0,
+            "transient pairing bit must be on by default"
+        );
     }
 
     #[test]

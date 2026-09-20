@@ -436,6 +436,23 @@ impl RaopRtp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::raop::AudioSession;
+
+    struct NoopSession;
+
+    impl AudioSession for NoopSession {
+        fn audio_process(&mut self, _samples: &[f32]) {}
+    }
+
+    struct NoopHandler;
+
+    impl AudioHandler for NoopHandler {
+        fn audio_init(&self, _format: AudioFormat) -> Box<dyn AudioSession> {
+            Box::new(NoopSession)
+        }
+    }
 
     #[test]
     fn peer_ip_matches_accepts_same_ip_different_port() {
@@ -449,5 +466,100 @@ mod tests {
         let expected: SocketAddr = "192.168.1.10:6000".parse().unwrap();
         let sender: SocketAddr = "192.168.1.11:6000".parse().unwrap();
         assert!(!peer_ip_matches(expected, sender));
+    }
+
+    #[test]
+    fn rtp_bind_addr_uses_unspecified_for_link_local_ipv6() {
+        let ll: IpAddr = "fe80::1234".parse().unwrap();
+        assert_eq!(rtp_bind_addr(ll), IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED));
+
+        let routable: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(rtp_bind_addr(routable), routable);
+
+        let v4: IpAddr = "192.168.10.2".parse().unwrap();
+        assert_eq!(rtp_bind_addr(v4), v4);
+    }
+
+    #[test]
+    fn remote_addr_bytes_parses_ipv4_ipv6_and_prefixed_ipv6() {
+        assert_eq!(
+            remote_addr_bytes("192.168.1.55"),
+            vec![192, 168, 1, 55]
+        );
+        assert_eq!(
+            remote_addr_bytes("IP6 ::1"),
+            std::net::Ipv6Addr::LOCALHOST.octets().to_vec()
+        );
+        assert!(remote_addr_bytes("not-an-ip").is_empty());
+    }
+
+    #[tokio::test]
+    async fn rtp_session_udp_start_and_flush_stop() {
+        let handler: Arc<dyn AudioHandler> = Arc::new(NoopHandler);
+        let mut rtp = RaopRtp::new(
+            handler,
+            RtpConfig {
+                remote: "127.0.0.1".into(),
+                local_addr: "127.0.0.1".parse().unwrap(),
+                rtpmap: "96 L16/44100/2".into(),
+                fmtp: None,
+                encryption: None,
+                output_sample_rate: Some(48_000),
+                remote_socket: "127.0.0.1:6000".parse().unwrap(),
+            },
+        )
+        .expect("valid L16 RTP config should construct");
+
+        let (cp, tp, dp) = rtp.start(true, 0, 0).expect("udp start should succeed");
+        assert!(cp > 0 && tp > 0 && dp > 0);
+
+        rtp.flush(1234);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(rtp.state.lock().await.flush, 1234);
+
+        rtp.stop();
+    }
+
+    #[tokio::test]
+    async fn rtp_session_tcp_start_and_stop() {
+        let handler: Arc<dyn AudioHandler> = Arc::new(NoopHandler);
+        let mut rtp = RaopRtp::new(
+            handler,
+            RtpConfig {
+                remote: "127.0.0.1".into(),
+                local_addr: "127.0.0.1".parse().unwrap(),
+                rtpmap: "96 L16/44100/2".into(),
+                fmtp: None,
+                encryption: None,
+                output_sample_rate: None,
+                remote_socket: "127.0.0.1:6000".parse().unwrap(),
+            },
+        )
+        .expect("valid L16 RTP config should construct");
+
+        let (cp, tp, dp) = rtp.start(false, 0, 0).expect("tcp start should succeed");
+        assert_eq!(cp, 0);
+        assert_eq!(tp, 0);
+        assert!(dp > 0);
+
+        rtp.stop();
+    }
+
+    #[test]
+    fn rtp_new_rejects_invalid_codec_config() {
+        let handler: Arc<dyn AudioHandler> = Arc::new(NoopHandler);
+        let bad = RaopRtp::new(
+            handler,
+            RtpConfig {
+                remote: "127.0.0.1".into(),
+                local_addr: "127.0.0.1".parse().unwrap(),
+                rtpmap: "96 NOTACODEC/44100/2".into(),
+                fmtp: None,
+                encryption: None,
+                output_sample_rate: None,
+                remote_socket: "127.0.0.1:6000".parse().unwrap(),
+            },
+        );
+        assert!(bad.is_none());
     }
 }

@@ -110,3 +110,137 @@ impl EventChannel {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{Duration, timeout};
+
+    fn server_event_channel(secret: &[u8; 64]) -> EncryptedChannel {
+        EncryptedChannel::events(secret).expect("server event channel")
+    }
+
+    fn client_event_channel(secret: &[u8; 64]) -> EncryptedChannel {
+        // Invert read/write labels relative to the server channel.
+        EncryptedChannel::new(
+            secret,
+            "Events-Salt",
+            "Events-Read-Encryption-Key",
+            "Events-Salt",
+            "Events-Write-Encryption-Key",
+        )
+        .expect("client event channel")
+    }
+
+    async fn connected_stream_pair() -> (TcpStream, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let client_task = tokio::spawn(async move {
+            TcpStream::connect(addr).await.expect("connect to listener")
+        });
+        let (server_stream, _) = listener.accept().await.expect("accept client");
+        let client_stream = client_task.await.expect("join client task");
+        (server_stream, client_stream)
+    }
+
+    #[test]
+    fn event_sender_send_reports_closed_channel() {
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        drop(rx);
+        let sender = EventSender::from_tx(tx);
+        let err = sender.send(vec![1, 2, 3]).expect_err("channel is closed");
+        assert!(err.to_string().contains("event channel closed"));
+    }
+
+    #[tokio::test]
+    async fn handle_stream_sends_encrypted_outbound_data() {
+        let secret = [0x44u8; 64];
+        let (server_stream, mut client_stream) = connected_stream_pair().await;
+
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let server = tokio::spawn(EventChannel::handle_stream(
+            server_stream,
+            server_event_channel(&secret),
+            rx,
+        ));
+
+        let payload = b"update-info-payload".to_vec();
+        tx.send(payload.clone()).expect("queue outbound event");
+
+        let mut encrypted = vec![0u8; 256];
+        let n = timeout(Duration::from_secs(1), client_stream.read(&mut encrypted))
+            .await
+            .expect("timely read")
+            .expect("socket read");
+        assert!(n > 0);
+
+        let mut client_channel = client_event_channel(&secret);
+        let (plain, consumed) = client_channel
+            .decrypt_ctx
+            .decrypt(&encrypted[..n])
+            .expect("decrypt outbound frame");
+        assert_eq!(consumed, n);
+        assert_eq!(plain, payload);
+
+        drop(tx);
+        client_stream.shutdown().await.expect("shutdown client stream");
+        timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server exits promptly")
+            .expect("server join");
+    }
+
+    #[tokio::test]
+    async fn handle_stream_stops_on_decrypt_error() {
+        let secret = [0x77u8; 64];
+        let (server_stream, mut client_stream) = connected_stream_pair().await;
+
+        let (_tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let server = tokio::spawn(EventChannel::handle_stream(
+            server_stream,
+            server_event_channel(&secret),
+            rx,
+        ));
+
+        // Complete framed block with block_len=0 triggers decrypt error path.
+        let bad_frame = vec![0u8; 2 + 16];
+        client_stream
+            .write_all(&bad_frame)
+            .await
+            .expect("send malformed frame");
+
+        timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server exits on decrypt error")
+            .expect("server join");
+    }
+
+    #[tokio::test]
+    async fn handle_stream_stops_when_encrypted_buffer_exceeds_limit() {
+        let secret = [0x99u8; 64];
+        let (server_stream, mut client_stream) = connected_stream_pair().await;
+
+        let (_tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let server = tokio::spawn(EventChannel::handle_stream(
+            server_stream,
+            server_event_channel(&secret),
+            rx,
+        ));
+
+        // Make decrypt() consume nothing while the encrypted buffer grows.
+        let mut oversized = Vec::with_capacity(MAX_ENCRYPTED_EVENT_BUFFER_LEN + 1024);
+        oversized.extend_from_slice(&[0xff, 0xff]);
+        oversized.resize(MAX_ENCRYPTED_EVENT_BUFFER_LEN + 1024, 0u8);
+        client_stream
+            .write_all(&oversized)
+            .await
+            .expect("send oversized encrypted data");
+
+        timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server exits on encrypted buffer limit")
+            .expect("server join");
+    }
+}

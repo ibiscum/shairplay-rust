@@ -873,7 +873,10 @@ fn setup_stream_video(
         .and_then(|v| v.as_signed_integer())
     {
         Some(id) if id < 0 => {
-            tracing::warn!(stream_connection_id = id, "AP2 video streamConnectionID is negative");
+            tracing::warn!(
+                stream_connection_id = id,
+                "AP2 video streamConnectionID is negative"
+            );
             conn.shared
                 .handler
                 .on_error(&ShairplayError::Crypto(CryptoError::FairPlay(
@@ -1133,4 +1136,588 @@ pub(crate) fn handle_audio_mode(
         tracing::debug!(mode, "POST /audioMode");
     }
     None
+}
+
+#[cfg(all(test, feature = "ap2"))]
+mod tests {
+    use super::*;
+    use crate::crypto::fairplay::FairPlay;
+    use crate::crypto::pairing::Pairing;
+    use crate::crypto::rsa::RsaKey;
+    use crate::proto::http::{HttpRequest, HttpResponse};
+    use crate::raop::connection::RaopShared;
+    use crate::raop::hls::HlsState;
+    use crate::raop::{AudioFormat, AudioHandler, AudioSession, MemoryPairingStore};
+    use std::sync::{Arc, Mutex};
+
+    struct NoopSession;
+
+    impl AudioSession for NoopSession {
+        fn audio_process(&mut self, _samples: &[f32]) {}
+    }
+
+    struct NoopHandler;
+
+    impl AudioHandler for NoopHandler {
+        fn audio_init(&self, _format: AudioFormat) -> Box<dyn AudioSession> {
+            Box::new(NoopSession)
+        }
+    }
+
+    fn test_connection() -> RaopConnection {
+        let shared = Arc::new(RaopShared {
+            rsakey: Arc::new(RsaKey::from_pem(include_str!("../../airport.key")).unwrap()),
+            pairing: Arc::new(Pairing::generate().unwrap()),
+            hwaddr: vec![0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
+            password: String::new(),
+            #[cfg(feature = "pipewire-auth-setup-compat")]
+            pipewire_auth_setup_compat: false,
+            handler: Arc::new(NoopHandler),
+            pairing_store: Arc::new(MemoryPairingStore::default()),
+            identity_seed: [3u8; 32],
+            output_sample_rate: None,
+            output_max_channels: None,
+            pin: Some("1234".into()),
+            #[cfg(feature = "video")]
+            video_handler: None,
+            #[cfg(feature = "video")]
+            video_ekey: Arc::new(std::sync::RwLock::new(None)),
+            #[cfg(feature = "video")]
+            video_eiv: Arc::new(std::sync::RwLock::new(None)),
+            pairing_id: "pairing-id".into(),
+            device_id: "10:20:30:40:50:60".into(),
+            airplay_name: "test-airplay".into(),
+            active_audio: Mutex::new(None),
+            #[cfg(feature = "hls")]
+            hls_handler: None,
+        });
+
+        RaopConnection {
+            raop_rtp: None,
+            fairplay: FairPlay::new(),
+            pairing: shared.pairing.create_session(),
+            local_addr: vec![127, 0, 0, 1],
+            remote_addr: vec![127, 0, 0, 1],
+            remote_socket: "127.0.0.1:7000".parse().unwrap(),
+            nonce: String::new(),
+            shared,
+            srp_server: None,
+            pair_verify: None,
+            ap2_shared_secret: None,
+            pair_verify_secret: None,
+            is_ap2: true,
+            playout_cmd: None,
+            event_sender: None,
+            #[cfg(feature = "video")]
+            ekey: None,
+            #[cfg(feature = "video")]
+            eiv: None,
+            #[cfg(feature = "hls")]
+            hls_state: HlsState::new(),
+        }
+    }
+
+    fn request_with_body(method: &str, url: &str, body: &[u8], content_type: Option<&str>) -> HttpRequest {
+        let mut req = HttpRequest::new();
+        let ct_header = content_type
+            .map(|ct| format!("Content-Type: {ct}\r\n"))
+            .unwrap_or_default();
+        let mut raw = format!(
+            "{method} {url} RTSP/1.0\r\nCSeq: 1\r\n{ct_header}Content-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(body);
+        req.add_data(&raw).unwrap();
+        req
+    }
+
+    fn request_without_body(method: &str, url: &str) -> HttpRequest {
+        let mut req = HttpRequest::new();
+        let raw = format!("{method} {url} RTSP/1.0\r\nCSeq: 1\r\n\r\n");
+        req.add_data(raw.as_bytes()).unwrap();
+        req
+    }
+
+    #[test]
+    fn build_update_info_message_contains_command_and_plist() {
+        let msg = build_update_info_message(true, false).expect("updateInfo should build");
+        let header_end = msg
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("rtsp header terminator")
+            + 4;
+        let headers = std::str::from_utf8(&msg[..header_end]).expect("ascii headers");
+        assert!(headers.starts_with("POST /command RTSP/1.0\r\n"));
+        assert!(headers.contains("Content-Type: application/x-apple-binary-plist"));
+
+        let plist: plist::Value = plist::from_bytes(&msg[header_end..]).expect("valid binary plist");
+        let dict = plist.as_dictionary().expect("plist dictionary");
+        assert_eq!(dict.get("type").and_then(|v| v.as_string()), Some("updateInfo"));
+        assert!(dict.get("value").and_then(|v| v.as_dictionary()).is_some());
+    }
+
+    #[test]
+    fn handle_pair_pin_start_and_record_add_expected_headers() {
+        let mut conn = test_connection();
+
+        let req = request_without_body("POST", "/pair-pin-start");
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+        assert!(handle_pair_pin_start(&mut conn, &req, &mut resp).is_none());
+        let pin_wire = String::from_utf8(resp.get_data().to_vec()).unwrap();
+        assert!(pin_wire.contains("Content-Type: application/octet-stream"));
+
+        let req_record = request_without_body("RECORD", "*");
+        let mut resp_record = HttpResponse::new("RTSP/1.0", 200, "OK");
+        assert!(handle_record(&mut conn, &req_record, &mut resp_record).is_none());
+        let rec_wire = String::from_utf8(resp_record.get_data().to_vec()).unwrap();
+        assert!(rec_wire.contains("Audio-Latency: 0"));
+    }
+
+    #[test]
+    fn handle_feedback_returns_stream_info_only_when_playout_active() {
+        let mut conn = test_connection();
+        let req = request_without_body("POST", "/feedback");
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+        assert!(handle_feedback(&mut conn, &req, &mut resp).is_none());
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        conn.playout_cmd = Some(tx);
+
+        let mut resp2 = HttpResponse::new("RTSP/1.0", 200, "OK");
+        let body = handle_feedback(&mut conn, &req, &mut resp2).expect("feedback plist body");
+        let parsed: plist::Value = plist::from_bytes(&body).expect("valid feedback plist");
+        let dict = parsed.as_dictionary().expect("feedback dictionary");
+        let streams = dict
+            .get("streams")
+            .and_then(|v| v.as_array())
+            .expect("streams array");
+        let first = streams
+            .first()
+            .and_then(|v| v.as_dictionary())
+            .expect("first stream dictionary");
+        assert_eq!(first.get("type").and_then(|v| v.as_signed_integer()), Some(103));
+
+        let wire = String::from_utf8(resp2.get_data().to_vec()).unwrap();
+        assert!(wire.contains("Content-Type: application/x-apple-binary-plist"));
+    }
+
+    #[test]
+    fn handle_set_rate_anchor_time_sends_playout_command() {
+        let mut conn = test_connection();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        conn.playout_cmd = Some(tx);
+
+        let mut dict = plist::Dictionary::new();
+        dict.insert("rate".into(), plist::Value::Integer(1_i64.into()));
+        dict.insert("rtpTime".into(), plist::Value::Integer(12345_i64.into()));
+        dict.insert("networkTimeSecs".into(), plist::Value::Integer(7_i64.into()));
+        dict.insert("networkTimeFrac".into(), plist::Value::Integer((1_u64 << 32).into()));
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(dict)).unwrap();
+
+        let req = request_with_body("POST", "/setrateanchorti", &body, Some("application/x-apple-binary-plist"));
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+        assert!(handle_set_rate_anchor_time(&mut conn, &req, &mut resp).is_none());
+
+        let cmd = rx.try_recv().expect("playout command should be sent");
+        match cmd {
+            crate::raop::buffered_audio::PlayoutCommand::SetRate {
+                anchor_rtp,
+                anchor_time_ns,
+                rate,
+            } => {
+                assert_eq!(anchor_rtp, 12345);
+                assert_eq!(rate, 1);
+                assert_eq!(anchor_time_ns, 7_000_000_000);
+            }
+            other => panic!("unexpected playout command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_flush_buffered_sends_flush_command() {
+        let mut conn = test_connection();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        conn.playout_cmd = Some(tx);
+
+        let mut dict = plist::Dictionary::new();
+        dict.insert("flushFromSeq".into(), plist::Value::Integer(10_i64.into()));
+        dict.insert("flushUntilSeq".into(), plist::Value::Integer(20_i64.into()));
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(dict)).unwrap();
+
+        let req = request_with_body(
+            "POST",
+            "/flushbuffered",
+            &body,
+            Some("application/x-apple-binary-plist"),
+        );
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+        assert!(handle_flush_buffered(&mut conn, &req, &mut resp).is_none());
+
+        let cmd = rx.try_recv().expect("flush command should be sent");
+        match cmd {
+            crate::raop::buffered_audio::PlayoutCommand::Flush {
+                from_seq,
+                until_seq,
+            } => {
+                assert_eq!(from_seq, 10);
+                assert_eq!(until_seq, 20);
+            }
+            other => panic!("unexpected playout command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_setup_rejects_invalid_plist_and_disconnects() {
+        let mut conn = test_connection();
+        let req = request_with_body("SETUP", "*", b"not-a-plist", Some("application/x-apple-binary-plist"));
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+
+        assert!(handle_setup(&mut conn, &req, &mut resp).is_none());
+        assert!(resp.get_disconnect());
+    }
+
+    #[tokio::test]
+    async fn setup_streams_type_96_realtime_returns_data_and_control_ports() {
+        let mut conn = test_connection();
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".into(), plist::Value::Integer(96_i64.into()));
+        stream.insert("sr".into(), plist::Value::Integer(48_000_i64.into()));
+        stream.insert("spf".into(), plist::Value::Integer(480_i64.into()));
+        stream.insert("audioFormat".into(), plist::Value::Integer(0_i64.into()));
+        stream.insert("shk".into(), plist::Value::Data(vec![7u8; 32]));
+
+        let resp = setup_streams(&mut conn, &[plist::Value::Dictionary(stream)]).expect("96 setup should succeed");
+        let streams = resp
+            .get("streams")
+            .and_then(|v| v.as_array())
+            .expect("streams array");
+        let s0 = streams
+            .first()
+            .and_then(|v| v.as_dictionary())
+            .expect("first stream dictionary");
+        assert_eq!(s0.get("type").and_then(|v| v.as_signed_integer()), Some(96));
+        assert!(s0.get("dataPort").and_then(|v| v.as_unsigned_integer()).unwrap_or(0) > 0);
+        assert!(
+            s0.get("controlPort")
+                .and_then(|v| v.as_unsigned_integer())
+                .unwrap_or(0)
+                > 0
+        );
+
+        // Stop the spawned realtime task to avoid background leakage.
+        let stop = conn.shared.active_audio.lock().unwrap().take();
+        if let Some(stop) = stop {
+            stop();
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_streams_type_103_buffered_sets_playout_and_buffer_size() {
+        let mut conn = test_connection();
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".into(), plist::Value::Integer(103_i64.into()));
+        stream.insert("audioFormat".into(), plist::Value::Integer(0_i64.into()));
+        stream.insert("shk".into(), plist::Value::Data(vec![9u8; 32]));
+
+        let resp = setup_streams(&mut conn, &[plist::Value::Dictionary(stream)]).expect("103 setup should succeed");
+        let streams = resp
+            .get("streams")
+            .and_then(|v| v.as_array())
+            .expect("streams array");
+        let s0 = streams
+            .first()
+            .and_then(|v| v.as_dictionary())
+            .expect("first stream dictionary");
+        assert_eq!(s0.get("type").and_then(|v| v.as_signed_integer()), Some(103));
+        assert!(s0.get("dataPort").and_then(|v| v.as_unsigned_integer()).unwrap_or(0) > 0);
+        assert_eq!(
+            s0.get("audioBufferSize")
+                .and_then(|v| v.as_signed_integer()),
+            Some(0x10_0000)
+        );
+        assert!(conn.playout_cmd.is_some());
+
+        let stop = conn.shared.active_audio.lock().unwrap().take();
+        if let Some(stop) = stop {
+            stop();
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_streams_type_130_with_seed_opens_data_channel() {
+        let mut conn = test_connection();
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".into(), plist::Value::Integer(130_i64.into()));
+        stream.insert("seed".into(), plist::Value::Integer(1_i64.into()));
+
+        let resp = setup_streams(&mut conn, &[plist::Value::Dictionary(stream)]).expect("130 setup should succeed");
+        let streams = resp
+            .get("streams")
+            .and_then(|v| v.as_array())
+            .expect("streams array");
+        let s0 = streams
+            .first()
+            .and_then(|v| v.as_dictionary())
+            .expect("first stream dictionary");
+        assert_eq!(s0.get("streamID").and_then(|v| v.as_signed_integer()), Some(1));
+        assert!(s0.get("dataPort").and_then(|v| v.as_unsigned_integer()).unwrap_or(0) > 0);
+        assert!(
+            s0.get("controlPort")
+                .and_then(|v| v.as_unsigned_integer())
+                .unwrap_or(0)
+                > 0
+        );
+    }
+
+    #[test]
+    fn setup_streams_type_130_without_seed_only_returns_stream_id() {
+        let mut conn = test_connection();
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".into(), plist::Value::Integer(130_i64.into()));
+
+        let resp = setup_streams(&mut conn, &[plist::Value::Dictionary(stream)]).expect("130 setup should succeed");
+        let streams = resp
+            .get("streams")
+            .and_then(|v| v.as_array())
+            .expect("streams array");
+        let s0 = streams
+            .first()
+            .and_then(|v| v.as_dictionary())
+            .expect("first stream dictionary");
+        assert_eq!(s0.get("streamID").and_then(|v| v.as_signed_integer()), Some(1));
+        assert!(s0.get("dataPort").is_none());
+    }
+
+    #[test]
+    fn setup_streams_rejects_missing_type_field() {
+        let mut conn = test_connection();
+        let stream = plist::Dictionary::new();
+        assert!(setup_streams(&mut conn, &[plist::Value::Dictionary(stream)]).is_none());
+    }
+
+    #[test]
+    fn handle_setup_disconnects_when_stream_103_has_invalid_shk() {
+        let mut conn = test_connection();
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".into(), plist::Value::Integer(103_i64.into()));
+        stream.insert("audioFormat".into(), plist::Value::Integer(0_i64.into()));
+        stream.insert("shk".into(), plist::Value::Data(vec![1u8; 3]));
+
+        let mut dict = plist::Dictionary::new();
+        dict.insert(
+            "streams".into(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(dict)).unwrap();
+
+        let req = request_with_body("SETUP", "*", &body, Some("application/x-apple-binary-plist"));
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+        assert!(handle_setup(&mut conn, &req, &mut resp).is_none());
+        assert!(resp.get_disconnect());
+    }
+
+    #[tokio::test]
+    async fn setup_initial_rc_only_returns_event_port_when_shared_secret_present() {
+        let mut conn = test_connection();
+        conn.ap2_shared_secret = Some(vec![0xAA; 32]);
+
+        let mut dict = plist::Dictionary::new();
+        dict.insert("isRemoteControlOnly".into(), plist::Value::Boolean(true));
+
+        let resp = setup_initial(&mut conn, &dict).expect("rc-only setup should succeed");
+        let event_port = resp
+            .get("eventPort")
+            .and_then(|v| v.as_unsigned_integer())
+            .expect("eventPort should exist");
+        assert!(event_port > 0);
+        assert!(conn.event_sender.is_some());
+    }
+
+    #[tokio::test]
+    async fn setup_initial_ptp_includes_timing_peer_info() {
+        let mut conn = test_connection();
+        conn.local_addr = vec![127, 0, 0, 1];
+
+        let mut dict = plist::Dictionary::new();
+        dict.insert(
+            "timingProtocol".into(),
+            plist::Value::String("PTP".into()),
+        );
+
+        let resp = setup_initial(&mut conn, &dict).expect("ptp setup should succeed");
+        let tpi = resp
+            .get("timingPeerInfo")
+            .and_then(|v| v.as_dictionary())
+            .expect("timingPeerInfo dictionary");
+        let id = tpi
+            .get("ID")
+            .and_then(|v| v.as_string())
+            .expect("timing peer ID");
+        assert_eq!(id, "127.0.0.1");
+
+        let addrs = tpi
+            .get("Addresses")
+            .and_then(|v| v.as_array())
+            .expect("Addresses array");
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].as_string(), Some("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn setup_initial_without_shared_secret_reports_legacy_event_port_zero() {
+        let mut conn = test_connection();
+        conn.ap2_shared_secret = None;
+
+        let dict = plist::Dictionary::new();
+        let resp = setup_initial(&mut conn, &dict).expect("initial setup should succeed");
+        assert_eq!(
+            resp.get("eventPort")
+                .and_then(|v| v.as_unsigned_integer()),
+            Some(0)
+        );
+        assert_eq!(
+            resp.get("timingPort")
+                .and_then(|v| v.as_unsigned_integer()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn pair_setup_falls_back_to_legacy_ap1_for_non_tlv_payload() {
+        let mut conn = test_connection();
+        let req = request_with_body(
+            "POST",
+            "/pair-setup",
+            &[0x11u8; 32],
+            Some("application/octet-stream"),
+        );
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+
+        let out = handle_pair_setup(&mut conn, &req, &mut resp).expect("legacy pair-setup should return key");
+        assert_eq!(out.len(), 32);
+        assert!(conn.srp_server.is_none());
+    }
+
+    #[test]
+    fn pair_setup_state1_malformed_tlv_returns_auth_error_tlv() {
+        let mut conn = test_connection();
+        let mut tlv = crate::crypto::tlv::TlvValues::new();
+        tlv.add(6, &[1]); // M1 state without required SRP fields
+        let body = tlv.encode();
+        let req = request_with_body(
+            "POST",
+            "/pair-setup",
+            &body,
+            Some("application/octet-stream"),
+        );
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+
+        let out = handle_pair_setup(&mut conn, &req, &mut resp).expect("should return pairing error TLV");
+        let decoded = crate::crypto::tlv::TlvValues::decode(&out).expect("valid tlv");
+        assert_eq!(decoded.get(6), Some(&[2u8][..]));
+        assert_eq!(decoded.get(7), Some(&[2u8][..]));
+    }
+
+    #[test]
+    fn pair_verify_falls_back_to_legacy_ap1_for_non_tlv_payload() {
+        let mut conn = test_connection();
+        let mut ap1_m1 = vec![0u8; 4 + 32 + 32];
+        ap1_m1[0] = 1;
+        let req = request_with_body(
+            "POST",
+            "/pair-verify",
+            &ap1_m1,
+            Some("application/octet-stream"),
+        );
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+
+        let out = handle_pair_verify(&mut conn, &req, &mut resp);
+        assert!(out.is_some(), "legacy AP1 pair-verify M1 should produce M2 reply");
+        assert!(conn.pair_verify.is_none());
+        assert!(conn.ap2_shared_secret.is_none());
+    }
+
+    #[test]
+    fn pair_verify_state1_malformed_tlv_returns_none() {
+        let mut conn = test_connection();
+        let mut tlv = crate::crypto::tlv::TlvValues::new();
+        tlv.add(6, &[1]); // missing required public key material
+        let body = tlv.encode();
+        let req = request_with_body(
+            "POST",
+            "/pair-verify",
+            &body,
+            Some("application/octet-stream"),
+        );
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+
+        assert!(handle_pair_verify(&mut conn, &req, &mut resp).is_none());
+        assert!(conn.pair_verify.is_none());
+    }
+
+    #[tokio::test]
+    async fn setup_initial_sets_video_eiv_into_connection_and_shared_state() {
+        let mut conn = test_connection();
+        let mut dict = plist::Dictionary::new();
+        dict.insert("eiv".into(), plist::Value::Data(vec![0xAB; 16]));
+
+        let _resp = setup_initial(&mut conn, &dict).expect("setup_initial should succeed");
+
+        assert_eq!(conn.eiv, Some([0xAB; 16]));
+        assert_eq!(*conn.shared.video_eiv.read().unwrap(), Some([0xAB; 16]));
+    }
+
+    #[tokio::test]
+    async fn setup_initial_with_malformed_ekey_does_not_store_video_key() {
+        let mut conn = test_connection();
+        let mut dict = plist::Dictionary::new();
+        dict.insert("ekey".into(), plist::Value::Data(vec![0x11; 72]));
+
+        let _resp = setup_initial(&mut conn, &dict).expect("setup_initial should still succeed");
+
+        assert!(conn.ekey.is_none());
+        assert!(conn.shared.video_ekey.read().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn setup_stream_realtime_legacy_path_under_video_feature() {
+        let mut conn = test_connection();
+        conn.ekey = Some([0x33; 16]);
+        conn.eiv = Some([0x44; 16]);
+
+        let mut stream0 = plist::Dictionary::new();
+        stream0.insert("sr".into(), plist::Value::Integer(44_100_i64.into()));
+        stream0.insert("spf".into(), plist::Value::Integer(352_i64.into()));
+        stream0.insert("audioFormat".into(), plist::Value::Integer(0_i64.into()));
+        stream0.insert("controlPort".into(), plist::Value::Integer(0_i64.into()));
+        // No shk => legacy path under video feature.
+
+        let mut stream_resp = plist::Dictionary::new();
+        setup_stream_realtime(&mut conn, &stream0, &mut stream_resp)
+            .expect("legacy realtime setup should succeed under video feature");
+
+        assert!(
+            stream_resp
+                .get("dataPort")
+                .and_then(|v| v.as_unsigned_integer())
+                .unwrap_or(0)
+                > 0
+        );
+        assert!(
+            stream_resp
+                .get("controlPort")
+                .and_then(|v| v.as_unsigned_integer())
+                .unwrap_or(0)
+                > 0
+        );
+        assert!(conn.raop_rtp.is_some());
+
+        if let Some(rtp) = &mut conn.raop_rtp {
+            rtp.stop();
+        }
+    }
 }

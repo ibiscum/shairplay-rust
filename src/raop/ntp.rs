@@ -106,6 +106,7 @@ pub(crate) fn spawn_ntp_responder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::{Duration, timeout};
 
     #[test]
     fn timing_request_signature_requires_len_and_type() {
@@ -157,5 +158,66 @@ mod tests {
         let remote: std::net::SocketAddr = "192.168.1.10:0".parse().unwrap();
         let sender: std::net::SocketAddr = "10.0.0.7:9000".parse().unwrap();
         assert!(sender_allowed(remote, sender));
+    }
+
+    #[tokio::test]
+    async fn spawn_ntp_responder_sends_initial_requests() {
+        let responder = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let responder_addr = responder.local_addr().unwrap();
+        let remote = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote.local_addr().unwrap();
+
+        spawn_ntp_responder(responder, remote_addr);
+
+        let mut buf = [0u8; 64];
+        let mut saw_initial = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Ok((len, from))) = timeout(Duration::from_millis(250), remote.recv_from(&mut buf)).await
+                && from == responder_addr
+                && len >= 32
+                && buf[1] == 0xd2
+            {
+                saw_initial = true;
+                break;
+            }
+        }
+
+        assert!(saw_initial, "expected at least one initial timing request");
+    }
+
+    #[tokio::test]
+    async fn spawn_ntp_responder_replies_to_valid_timing_request() {
+        let responder = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let responder_addr = responder.local_addr().unwrap();
+        let remote = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote.local_addr().unwrap();
+
+        spawn_ntp_responder(responder, remote_addr);
+
+        let mut req = [0u8; 32];
+        req[0] = 0x80;
+        req[1] = 0x52;
+        req[24..28].copy_from_slice(&0xCAFE_BABEu32.to_be_bytes());
+        req[28..32].copy_from_slice(&0x0102_0304u32.to_be_bytes());
+        remote.send_to(&req, responder_addr).await.unwrap();
+
+        let mut buf = [0u8; 64];
+        let mut saw_response = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Ok((len, from))) = timeout(Duration::from_millis(250), remote.recv_from(&mut buf)).await
+                && from == responder_addr
+                && len >= 32
+                && buf[1] == 0xd3
+            {
+                assert_eq!(&buf[8..12], &0xCAFE_BABEu32.to_be_bytes());
+                assert_eq!(&buf[12..16], &0x0102_0304u32.to_be_bytes());
+                saw_response = true;
+                break;
+            }
+        }
+
+        assert!(saw_response, "expected timing response packet");
     }
 }

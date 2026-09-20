@@ -87,8 +87,8 @@ impl RaopShared {
 #[cfg(all(test, feature = "ap2"))]
 mod tests {
     use super::swap_active_audio_slot;
-    use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn swap_active_audio_runs_previous_handle() {
@@ -96,15 +96,21 @@ mod tests {
 
         let count = Arc::new(AtomicUsize::new(0));
         let count_a = count.clone();
-        swap_active_audio_slot(&slot, Box::new(move || {
-            count_a.fetch_add(1, Ordering::SeqCst);
-        }));
+        swap_active_audio_slot(
+            &slot,
+            Box::new(move || {
+                count_a.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
         assert_eq!(count.load(Ordering::SeqCst), 0);
 
         let count_b = count.clone();
-        swap_active_audio_slot(&slot, Box::new(move || {
-            count_b.fetch_add(1, Ordering::SeqCst);
-        }));
+        swap_active_audio_slot(
+            &slot,
+            Box::new(move || {
+                count_b.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
@@ -119,14 +125,20 @@ mod tests {
 
         let count = Arc::new(AtomicUsize::new(0));
         let count_a = count.clone();
-        swap_active_audio_slot(&slot, Box::new(move || {
-            count_a.fetch_add(1, Ordering::SeqCst);
-        }));
+        swap_active_audio_slot(
+            &slot,
+            Box::new(move || {
+                count_a.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
 
         let count_b = count.clone();
-        swap_active_audio_slot(&slot, Box::new(move || {
-            count_b.fetch_add(1, Ordering::SeqCst);
-        }));
+        swap_active_audio_slot(
+            &slot,
+            Box::new(move || {
+                count_b.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

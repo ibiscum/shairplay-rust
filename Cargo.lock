@@ -1817,7 +1817,6 @@ dependencies = [
  "gethostname",
  "hex",
  "hkdf",
- "hmac",
  "httparse",
  "md-5",
  "mdns-sd",

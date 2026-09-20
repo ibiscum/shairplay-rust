@@ -95,16 +95,11 @@ mod ap1_advertisement_tests {
     fn rejects_empty_and_duplicate_configurations() {
         assert!(Ap1Advertisement::try_new(Some(Vec::new()), None).is_err());
         assert!(Ap1Advertisement::try_new(None, Some(Vec::new())).is_err());
-        assert!(Ap1Advertisement::try_new(
-            Some(vec![Ap1Codec::Pcm, Ap1Codec::Pcm]),
-            None
-        )
-        .is_err());
-        assert!(Ap1Advertisement::try_new(
-            None,
-            Some(vec![Ap1Encryption::None, Ap1Encryption::None]),
-        )
-        .is_err());
+        assert!(Ap1Advertisement::try_new(Some(vec![Ap1Codec::Pcm, Ap1Codec::Pcm]), None).is_err());
+        assert!(
+            Ap1Advertisement::try_new(None, Some(vec![Ap1Encryption::None, Ap1Encryption::None]),)
+                .is_err()
+        );
     }
 }
 

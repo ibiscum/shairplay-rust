@@ -257,3 +257,133 @@ pub trait RemoteControl: Send + Sync {
     /// Commands the source device supports. AP1 returns all; AP2 returns advertised set.
     fn available_commands(&self) -> Vec<RemoteCommand>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[test]
+    fn ap1_codec_txt_values_match_protocol() {
+        assert_eq!(Ap1Codec::Pcm.txt_value(), "0");
+        assert_eq!(Ap1Codec::Alac.txt_value(), "1");
+    }
+
+    #[test]
+    fn ap1_encryption_txt_values_match_protocol() {
+        assert_eq!(Ap1Encryption::None.txt_value(), "0");
+        assert_eq!(Ap1Encryption::Rsa.txt_value(), "1");
+        assert_eq!(Ap1Encryption::FairPlay.txt_value(), "3");
+    }
+
+    struct NoopRemote;
+
+    impl RemoteControl for NoopRemote {
+        fn send_command(&self, _cmd: RemoteCommand) -> Result<(), crate::error::ShairplayError> {
+            Ok(())
+        }
+
+        fn available_commands(&self) -> Vec<RemoteCommand> {
+            vec![RemoteCommand::Play, RemoteCommand::SetVolume(20)]
+        }
+    }
+
+    struct TestAudioSession {
+        calls: usize,
+    }
+
+    impl AudioSession for TestAudioSession {
+        fn audio_process(&mut self, samples: &[f32]) {
+            self.calls += samples.len();
+        }
+    }
+
+    struct TestAudioHandler {
+        init_count: Mutex<usize>,
+    }
+
+    impl AudioHandler for TestAudioHandler {
+        fn audio_init(&self, format: AudioFormat) -> Box<dyn AudioSession> {
+            assert_eq!(format.codec, AudioCodec::Pcm);
+            assert_eq!(format.bits, 32);
+            assert_eq!(format.channels, 2);
+            assert_eq!(format.sample_rate, 44_100);
+            *self.init_count.lock().expect("init count mutex poisoned") += 1;
+            Box::new(TestAudioSession { calls: 0 })
+        }
+    }
+
+    #[test]
+    fn audio_handler_default_callbacks_are_callable() {
+        let handler = TestAudioHandler {
+            init_count: Mutex::new(0),
+        };
+
+        let mut session = handler.audio_init(AudioFormat {
+            codec: AudioCodec::Pcm,
+            bits: 32,
+            channels: 2,
+            sample_rate: 44_100,
+        });
+        session.audio_process(&[0.0, 0.5, -0.5]);
+        session.audio_flush();
+
+        handler.on_volume(-12.0);
+        handler.on_coverart(b"png");
+        handler.on_progress(1, 2, 3);
+        handler.on_client_connected("127.0.0.1:7000");
+        handler.on_client_disconnected("127.0.0.1:7000");
+        handler.on_remote_control(Arc::new(NoopRemote));
+
+        assert_eq!(*handler.init_count.lock().expect("init count mutex poisoned"), 1);
+    }
+
+    #[cfg(feature = "ap2")]
+    struct EmptyPairingStore;
+
+    #[cfg(feature = "ap2")]
+    impl PairingStore for EmptyPairingStore {
+        fn get(&self, _device_id: &str) -> Option<[u8; 32]> {
+            None
+        }
+
+        fn put(&self, _device_id: &str, _public_key: [u8; 32]) {}
+
+        fn remove(&self, _device_id: &str) {}
+    }
+
+    #[cfg(feature = "ap2")]
+    #[test]
+    fn pairing_store_default_methods_are_safe() {
+        let store = EmptyPairingStore;
+        assert!(!store.has_any_pairing());
+        assert_eq!(store.load_identity(), None);
+        store.save_identity([7u8; 32]);
+        assert_eq!(store.load_identity(), None);
+    }
+
+    #[cfg(feature = "ap2")]
+    #[test]
+    fn memory_pairing_store_roundtrip_and_identity() {
+        let store = MemoryPairingStore::default();
+        assert!(!store.has_any_pairing());
+        assert_eq!(store.load_identity(), None);
+
+        store.put("dev1", [1u8; 32]);
+        assert!(store.has_any_pairing());
+        assert_eq!(store.get("dev1"), Some([1u8; 32]));
+
+        store.save_identity([9u8; 32]);
+        assert_eq!(store.load_identity(), Some([9u8; 32]));
+
+        store.remove("dev1");
+        assert_eq!(store.get("dev1"), None);
+        assert!(!store.has_any_pairing());
+    }
+
+    #[cfg(feature = "ap2")]
+    #[test]
+    fn airplay_mode_default_is_ap2() {
+        assert_eq!(AirPlayMode::default(), AirPlayMode::AirPlay2);
+    }
+}

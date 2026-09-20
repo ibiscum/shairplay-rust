@@ -76,7 +76,6 @@ pub(crate) async fn run(
             Ok((stream, addr)) if peer_ip_matches(expected_peer_ip, addr) => break (stream, addr),
             Ok((_, addr)) => {
                 warn!(%addr, expected = %expected_peer_ip, "Video stream connection from unexpected peer");
-                continue;
             }
             Err(e) => {
                 warn!("Video stream accept failed: {e}");
@@ -138,6 +137,56 @@ async fn process(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::AsyncWriteExt;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedPacket {
+        kind: PacketKind,
+        timestamp: u64,
+        payload: Vec<u8>,
+    }
+
+    struct RecordingSession {
+        packets: Arc<Mutex<Vec<RecordedPacket>>>,
+        ended: Arc<AtomicBool>,
+    }
+
+    impl VideoSession for RecordingSession {
+        fn on_video(&mut self, packet: VideoPacket) {
+            self.packets
+                .lock()
+                .expect("recording session mutex poisoned")
+                .push(RecordedPacket {
+                    kind: packet.kind,
+                    timestamp: packet.timestamp,
+                    payload: packet.payload.to_vec(),
+                });
+        }
+
+        fn on_video_end(&mut self) {
+            self.ended.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn make_header(payload_len: u32, packet_type: u16, timestamp: u64) -> [u8; VIDEO_HEADER_LEN] {
+        let mut header = [0u8; VIDEO_HEADER_LEN];
+        header[..4].copy_from_slice(&payload_len.to_le_bytes());
+        header[4..6].copy_from_slice(&packet_type.to_le_bytes());
+        header[8..16].copy_from_slice(&timestamp.to_le_bytes());
+        header
+    }
+
+    async fn connected_tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_task = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server, _) = listener.accept().await.unwrap();
+        let client = client_task.await.unwrap();
+        (server, client)
+    }
 
     #[test]
     fn parses_little_endian_header_fields() {
@@ -174,5 +223,117 @@ mod tests {
         let expected: std::net::IpAddr = "192.168.1.10".parse().unwrap();
         let actual: std::net::SocketAddr = "192.168.1.11:7000".parse().unwrap();
         assert!(!peer_ip_matches(expected, actual));
+    }
+
+    #[tokio::test]
+    async fn process_decrypts_payload_skips_empty_and_ends_on_oversized_payload() {
+        let key = [0x11u8; 16];
+        let iv = [0x22u8; 16];
+
+        let (server, mut client) = connected_tcp_pair().await;
+
+        // Empty packet should be ignored.
+        client
+            .write_all(&make_header(0, 0, 1))
+            .await
+            .expect("write empty packet header");
+
+        // Encrypted payload packet should be decrypted and forwarded.
+        let plaintext = b"video payload".to_vec();
+        let mut encrypted = plaintext.clone();
+        let mut sender_cipher = VideoCipher::new(&key, &iv);
+        sender_cipher.decrypt(&mut encrypted);
+        client
+            .write_all(&make_header(encrypted.len() as u32, 0, 2))
+            .await
+            .expect("write payload header");
+        client
+            .write_all(&encrypted)
+            .await
+            .expect("write encrypted payload");
+
+        // Oversized payload should terminate the stream loop.
+        client
+            .write_all(&make_header((MAX_VIDEO_PAYLOAD_LEN as u32) + 1, 0, 3))
+            .await
+            .expect("write oversized header");
+        client.shutdown().await.expect("shutdown test client");
+
+        let packets = Arc::new(Mutex::new(Vec::new()));
+        let ended = Arc::new(AtomicBool::new(false));
+        let session = RecordingSession {
+            packets: Arc::clone(&packets),
+            ended: Arc::clone(&ended),
+        };
+
+        process(server, VideoCipher::new(&key, &iv), Box::new(session)).await;
+
+        let got = packets
+            .lock()
+            .expect("recording session mutex poisoned")
+            .clone();
+        assert_eq!(
+            got,
+            vec![RecordedPacket {
+                kind: PacketKind::Payload,
+                timestamp: 2,
+                payload: plaintext,
+            }]
+        );
+        assert!(ended.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn run_accepts_expected_peer_and_processes_stream() {
+        let key = [0x33u8; 16];
+        let iv = [0x44u8; 16];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let packets = Arc::new(Mutex::new(Vec::new()));
+        let ended = Arc::new(AtomicBool::new(false));
+        let session = RecordingSession {
+            packets: Arc::clone(&packets),
+            ended: Arc::clone(&ended),
+        };
+
+        let run_task = tokio::spawn(run(
+            listener,
+            "127.0.0.1".parse().unwrap(),
+            VideoCipher::new(&key, &iv),
+            Box::new(session),
+        ));
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let plaintext = b"abc123".to_vec();
+        let mut encrypted = plaintext.clone();
+        let mut sender_cipher = VideoCipher::new(&key, &iv);
+        sender_cipher.decrypt(&mut encrypted);
+
+        client
+            .write_all(&make_header(encrypted.len() as u32, 0, 99))
+            .await
+            .expect("write packet header");
+        client
+            .write_all(&encrypted)
+            .await
+            .expect("write encrypted packet");
+        client.shutdown().await.expect("shutdown test client");
+
+        run_task.await.expect("run task join");
+
+        let got = packets
+            .lock()
+            .expect("recording session mutex poisoned")
+            .clone();
+        assert_eq!(
+            got,
+            vec![RecordedPacket {
+                kind: PacketKind::Payload,
+                timestamp: 99,
+                payload: plaintext,
+            }]
+        );
+        assert!(ended.load(Ordering::SeqCst));
     }
 }

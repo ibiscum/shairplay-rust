@@ -88,9 +88,7 @@ mod tests {
 
     #[test]
     fn content_type_validation_is_still_strict() {
-        let wrong_type = request_with_headers(
-            "Content-Length: 33\r\nContent-Type: text/plain\r\n",
-        );
+        let wrong_type = request_with_headers("Content-Length: 33\r\nContent-Type: text/plain\r\n");
         assert!(!has_expected_content_type(&wrong_type));
     }
 

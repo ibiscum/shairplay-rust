@@ -122,8 +122,14 @@ mod tests {
         let key = RsaKey::from_pem(AIRPORT_KEY).expect("airport.key valid");
         let challenge = B64.encode(b"abc");
 
-        assert!(key.sign_challenge(&challenge, &[127, 0, 0], &[0, 1, 2, 3, 4, 5]).is_err());
-        assert!(key.sign_challenge(&challenge, &[127, 0, 0, 1], &[0, 1, 2, 3, 4]).is_err());
+        assert!(
+            key.sign_challenge(&challenge, &[127, 0, 0], &[0, 1, 2, 3, 4, 5])
+                .is_err()
+        );
+        assert!(
+            key.sign_challenge(&challenge, &[127, 0, 0, 1], &[0, 1, 2, 3, 4])
+                .is_err()
+        );
     }
 
     #[test]
@@ -159,7 +165,11 @@ mod tests {
         let public = RsaPublicKey::from(&key.key);
         let plaintext = b"0123456789abcdef";
         let ciphertext = public
-            .encrypt(&mut rand::thread_rng(), Oaep::new::<sha1::Sha1>(), plaintext)
+            .encrypt(
+                &mut rand::thread_rng(),
+                Oaep::new::<sha1::Sha1>(),
+                plaintext,
+            )
             .expect("encrypt with airport public key");
         let b64 = B64.encode(ciphertext);
 

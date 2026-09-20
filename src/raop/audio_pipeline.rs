@@ -81,7 +81,13 @@ mod tests {
     #[test]
     fn decrypt_rtp_chacha_rejects_short_and_tampered() {
         let cipher = ChaCha20Poly1305::new((&[7u8; 32]).into());
-        assert!(decrypt_rtp_chacha(&cipher, &[0u8; RTP_HEADER_LEN + CHACHA_TAG_LEN + NONCE_TRAIL_LEN - 1]).is_none());
+        assert!(
+            decrypt_rtp_chacha(
+                &cipher,
+                &[0u8; RTP_HEADER_LEN + CHACHA_TAG_LEN + NONCE_TRAIL_LEN - 1]
+            )
+            .is_none()
+        );
         let header = [0x80, 0x60, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3];
         let mut pkt = encrypt_frame(&cipher, header, [9u8; 8], b"payload");
         pkt[RTP_HEADER_LEN] ^= 0xff; // corrupt ciphertext → tag fails

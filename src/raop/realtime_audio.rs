@@ -45,7 +45,11 @@ fn normalize_output_config(config: &OutputConfig) -> OutputConfig {
         } else {
             config.samples_per_frame
         },
-        channels: if config.channels == 0 { 2 } else { config.channels },
+        channels: if config.channels == 0 {
+            2
+        } else {
+            config.channels
+        },
         bit_depth: if config.bit_depth == 0 {
             16
         } else {
@@ -181,6 +185,12 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::time::{Duration, Instant};
+
+    use crate::raop::audio_pipeline::CHACHA_TAG_LEN;
 
     #[test]
     fn alac_decoder_info_uses_realtime_setup_values() {
@@ -240,5 +250,133 @@ mod tests {
 
         let cfg = normalize_output_config(&original);
         assert_eq!(cfg, original);
+    }
+
+    struct CaptureSession {
+        process_calls: Arc<AtomicUsize>,
+    }
+
+    impl crate::raop::AudioSession for CaptureSession {
+        fn audio_process(&mut self, _samples: &[f32]) {
+            self.process_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct CaptureHandler {
+        init_calls: Arc<AtomicUsize>,
+        process_calls: Arc<AtomicUsize>,
+        init_format: Arc<Mutex<Option<AudioFormat>>>,
+    }
+
+    impl AudioHandler for CaptureHandler {
+        fn audio_init(&self, format: AudioFormat) -> Box<dyn crate::raop::AudioSession> {
+            self.init_calls.fetch_add(1, Ordering::SeqCst);
+            *self
+                .init_format
+                .lock()
+                .expect("init format mutex poisoned") = Some(format);
+            Box::new(CaptureSession {
+                process_calls: Arc::clone(&self.process_calls),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_ignores_too_short_packets_without_initializing_session() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let init_calls = Arc::new(AtomicUsize::new(0));
+        let process_calls = Arc::new(AtomicUsize::new(0));
+        let init_format = Arc::new(Mutex::new(None));
+        let handler: Arc<dyn AudioHandler> = Arc::new(CaptureHandler {
+            init_calls: Arc::clone(&init_calls),
+            process_calls: Arc::clone(&process_calls),
+            init_format: Arc::clone(&init_format),
+        });
+
+        let task = tokio::spawn(run(
+            receiver,
+            [7u8; 32],
+            handler,
+            OutputConfig {
+                source_sample_rate: 44_100,
+                samples_per_frame: 352,
+                channels: 2,
+                bit_depth: 16,
+                sample_rate: None,
+                max_channels: None,
+            },
+        ));
+
+        // len == RTP_HEADER_LEN + NONCE_TRAIL_LEN should be ignored early.
+        let short = vec![0u8; RTP_HEADER_LEN + NONCE_TRAIL_LEN];
+        sender.send_to(&short, receiver_addr).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        task.abort();
+
+        assert_eq!(init_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(process_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            init_format
+                .lock()
+                .expect("init format mutex poisoned")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_initializes_session_before_decrypt_with_expected_format() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let init_calls = Arc::new(AtomicUsize::new(0));
+        let process_calls = Arc::new(AtomicUsize::new(0));
+        let init_format = Arc::new(Mutex::new(None));
+        let handler: Arc<dyn AudioHandler> = Arc::new(CaptureHandler {
+            init_calls: Arc::clone(&init_calls),
+            process_calls: Arc::clone(&process_calls),
+            init_format: Arc::clone(&init_format),
+        });
+
+        let task = tokio::spawn(run(
+            receiver,
+            [9u8; 32],
+            handler,
+            OutputConfig {
+                source_sample_rate: 48_000,
+                samples_per_frame: 480,
+                channels: 6,
+                bit_depth: 24,
+                sample_rate: Some(96_000),
+                max_channels: Some(2),
+            },
+        ));
+
+        // Large enough to pass len guard and trigger lazy init, but invalid so decrypt fails.
+        let invalid_packet = vec![0u8; RTP_HEADER_LEN + CHACHA_TAG_LEN + NONCE_TRAIL_LEN];
+        sender.send_to(&invalid_packet, receiver_addr).await.unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while init_calls.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        task.abort();
+
+        assert_eq!(init_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(process_calls.load(Ordering::SeqCst), 0);
+
+        let format = init_format
+            .lock()
+            .expect("init format mutex poisoned")
+            .expect("audio_init should capture format");
+        assert_eq!(format.codec, AudioCodec::Pcm);
+        assert_eq!(format.bits, 32);
+        assert_eq!(format.channels, 2);
+        assert_eq!(format.sample_rate, 96_000);
     }
 }

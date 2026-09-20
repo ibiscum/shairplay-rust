@@ -65,6 +65,75 @@ struct PlayoutState {
     flush_pending: bool,
 }
 
+fn apply_playout_command(
+    s: &mut PlayoutState,
+    cmd: PlayoutCommand,
+    now_ns_fn: impl FnOnce() -> u64,
+) -> bool {
+    match cmd {
+        PlayoutCommand::SetRate {
+            anchor_rtp,
+            anchor_time_ns: _,
+            rate,
+        } => {
+            s.anchor_rtp = anchor_rtp;
+            let was_paused = s.rate == 0;
+            s.rate = rate;
+            if rate == 0 {
+                info!("Playout paused");
+            } else {
+                // Set anchor so the earliest buffered frame is deliverable
+                // with a small lead time for smooth playback.
+                if let Some(&first_ts) = s.buffer.keys().next() {
+                    let lead_frames = s.sample_rate / 10; // 100ms lead
+                    s.anchor_rtp = first_ts.wrapping_sub(lead_frames);
+                }
+                s.anchor_local_ns = now_ns_fn();
+                let stale: Vec<u32> = s
+                    .buffer
+                    .keys()
+                    .filter(|&&ts| (s.anchor_rtp.wrapping_sub(ts) as i32) > 0)
+                    .copied()
+                    .collect();
+                if !stale.is_empty() {
+                    debug!(discarded = stale.len(), "Discarded stale frames");
+                }
+                for k in stale {
+                    s.buffer.remove(&k);
+                }
+                if was_paused {
+                    info!(anchor_rtp, "Playout started");
+                }
+            }
+            true
+        }
+        PlayoutCommand::Flush {
+            from_seq,
+            until_seq,
+        } => {
+            let keys: Vec<u32> = s
+                .buffer
+                .keys()
+                .filter(|&&ts| ts >= from_seq && ts <= until_seq)
+                .copied()
+                .collect();
+            for k in &keys {
+                s.buffer.remove(k);
+            }
+            // Mirror AP1 behavior: propagate RTSP flush to the active
+            // audio session even when no queued frame matches.
+            s.flush_pending = true;
+            debug!(flushed = keys.len(), "Flushed");
+            true
+        }
+        PlayoutCommand::Stop => {
+            s.stopped = true;
+            s.buffer.clear();
+            false
+        }
+    }
+}
+
 /// TCP listener for buffered audio. Binds a port and spawns the processing pipeline.
 pub(crate) struct BufferedAudioProcessor {
     /// TCP listener waiting for the iPhone to connect.
@@ -112,68 +181,10 @@ impl BufferedAudioProcessor {
             while let Some(cmd) = cmd_rx.recv().await {
                 let (lock, cvar) = &*state3;
                 let mut s = lock.lock().unwrap();
-                match cmd {
-                    PlayoutCommand::SetRate {
-                        anchor_rtp,
-                        anchor_time_ns: _,
-                        rate,
-                    } => {
-                        s.anchor_rtp = anchor_rtp;
-                        let was_paused = s.rate == 0;
-                        s.rate = rate;
-                        if rate == 0 {
-                            info!("Playout paused");
-                        } else {
-                            // Set anchor so the earliest buffered frame is deliverable
-                            // with a small lead time for smooth playback
-                            if let Some(&first_ts) = s.buffer.keys().next() {
-                                let lead_frames = s.sample_rate / 10; // 100ms lead
-                                s.anchor_rtp = first_ts.wrapping_sub(lead_frames);
-                            }
-                            s.anchor_local_ns = now_ns();
-                            let stale: Vec<u32> = s
-                                .buffer
-                                .keys()
-                                .filter(|&&ts| (s.anchor_rtp.wrapping_sub(ts) as i32) > 0)
-                                .copied()
-                                .collect();
-                            if !stale.is_empty() {
-                                debug!(discarded = stale.len(), "Discarded stale frames");
-                            }
-                            for k in stale {
-                                s.buffer.remove(&k);
-                            }
-                            if was_paused {
-                                info!(anchor_rtp, "Playout started");
-                            }
-                        }
-                        cvar.notify_all();
-                    }
-                    PlayoutCommand::Flush {
-                        from_seq,
-                        until_seq,
-                    } => {
-                        let keys: Vec<u32> = s
-                            .buffer
-                            .keys()
-                            .filter(|&&ts| ts >= from_seq && ts <= until_seq)
-                            .copied()
-                            .collect();
-                        for k in &keys {
-                            s.buffer.remove(k);
-                        }
-                        // Mirror AP1 behavior: propagate RTSP flush to the active
-                        // audio session even when no queued frame matches.
-                        s.flush_pending = true;
-                        cvar.notify_all();
-                        debug!(flushed = keys.len(), "Flushed");
-                    }
-                    PlayoutCommand::Stop => {
-                        s.stopped = true;
-                        s.buffer.clear();
-                        cvar.notify_all();
-                        break;
-                    }
+                let keep_running = apply_playout_command(&mut s, cmd, now_ns);
+                cvar.notify_all();
+                if !keep_running {
+                    break;
                 }
             }
         });
@@ -393,4 +404,202 @@ fn delivery_loop(
         }
     }
     info!("Delivery loop ended");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    struct CountingSession {
+        processed: Arc<AtomicUsize>,
+        flushed: Arc<AtomicUsize>,
+    }
+
+    impl crate::raop::AudioSession for CountingSession {
+        fn audio_process(&mut self, samples: &[f32]) {
+            self.processed.fetch_add(samples.len(), Ordering::SeqCst);
+        }
+
+        fn audio_flush(&mut self) {
+            self.flushed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct CountingHandler {
+        init_calls: Arc<AtomicUsize>,
+        processed: Arc<AtomicUsize>,
+        flushed: Arc<AtomicUsize>,
+    }
+
+    impl AudioHandler for CountingHandler {
+        fn audio_init(&self, _format: AudioFormat) -> Box<dyn crate::raop::AudioSession> {
+            self.init_calls.fetch_add(1, Ordering::SeqCst);
+            Box::new(CountingSession {
+                processed: Arc::clone(&self.processed),
+                flushed: Arc::clone(&self.flushed),
+            })
+        }
+    }
+
+    fn fresh_state() -> PlayoutState {
+        PlayoutState {
+            buffer: BTreeMap::new(),
+            anchor_rtp: 0,
+            anchor_local_ns: 0,
+            rate: 0,
+            sample_rate: 44_100,
+            channels: 2,
+            stopped: false,
+            format_changed: false,
+            flush_pending: false,
+        }
+    }
+
+    #[test]
+    fn apply_playout_command_set_rate_sets_anchor_and_discards_stale() {
+        let mut s = fresh_state();
+        s.buffer.insert(10_000, vec![0.1; 4]);
+        s.buffer.insert(20_000, vec![0.2; 4]);
+
+        let keep = apply_playout_command(
+            &mut s,
+            PlayoutCommand::SetRate {
+                anchor_rtp: 1,
+                anchor_time_ns: 0,
+                rate: 1,
+            },
+            || 123,
+        );
+
+        assert!(keep);
+        // lead_frames = 44100/10 = 4410 => anchor 10000-4410=5590, so 10000/20000 remain fresh
+        assert_eq!(s.anchor_rtp, 5_590);
+        assert_eq!(s.anchor_local_ns, 123);
+        assert_eq!(s.rate, 1);
+        assert!(s.buffer.contains_key(&10_000));
+        assert!(s.buffer.contains_key(&20_000));
+    }
+
+    #[test]
+    fn apply_playout_command_flush_and_stop_paths() {
+        let mut s = fresh_state();
+        s.buffer.insert(100, vec![0.1]);
+        s.buffer.insert(200, vec![0.2]);
+        s.buffer.insert(300, vec![0.3]);
+
+        let keep = apply_playout_command(
+            &mut s,
+            PlayoutCommand::Flush {
+                from_seq: 150,
+                until_seq: 300,
+            },
+            now_ns,
+        );
+        assert!(keep);
+        assert!(s.flush_pending);
+        assert!(s.buffer.contains_key(&100));
+        assert!(!s.buffer.contains_key(&200));
+        assert!(!s.buffer.contains_key(&300));
+
+        let keep = apply_playout_command(&mut s, PlayoutCommand::Stop, now_ns);
+        assert!(!keep);
+        assert!(s.stopped);
+        assert!(s.buffer.is_empty());
+    }
+
+    #[test]
+    fn delivery_loop_initializes_session_and_processes_ready_frames_and_flush() {
+        let state = Arc::new((Mutex::new(fresh_state()), Condvar::new()));
+        let init_calls = Arc::new(AtomicUsize::new(0));
+        let processed = Arc::new(AtomicUsize::new(0));
+        let flushed = Arc::new(AtomicUsize::new(0));
+        let handler: Arc<dyn AudioHandler> = Arc::new(CountingHandler {
+            init_calls: Arc::clone(&init_calls),
+            processed: Arc::clone(&processed),
+            flushed: Arc::clone(&flushed),
+        });
+
+        {
+            let (lock, _) = &*state;
+            let mut s = lock.lock().unwrap();
+            s.sample_rate = 10;
+            s.channels = 2;
+            s.format_changed = true;
+            s.rate = 1;
+            s.anchor_rtp = 0;
+            s.anchor_local_ns = now_ns().saturating_sub(2_000_000_000);
+            s.flush_pending = true;
+            s.buffer.insert(1, vec![0.1, 0.2]);
+            s.buffer.insert(2, vec![0.3, 0.4]);
+        }
+
+        let state2 = Arc::clone(&state);
+        let handler2 = Arc::clone(&handler);
+        let thread = std::thread::spawn(move || {
+            delivery_loop(
+                state2,
+                handler2,
+                OutputConfig {
+                    sample_rate: None,
+                    max_channels: None,
+                },
+            );
+        });
+
+        std::thread::sleep(Duration::from_millis(30));
+        {
+            let (lock, cvar) = &*state;
+            let mut s = lock.lock().unwrap();
+            s.stopped = true;
+            cvar.notify_all();
+        }
+        thread.join().unwrap();
+
+        assert!(init_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(processed.load(Ordering::SeqCst), 4);
+        assert!(flushed.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn receive_loop_invalid_short_packet_marks_stopped() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            // total_len = 1 (< 2) -> receiver breaks.
+            stream.write_all(&[0, 1]).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let (server_stream, _) = listener.accept().await.unwrap();
+
+        let state = Arc::new((Mutex::new(fresh_state()), Condvar::new()));
+        let handler: Arc<dyn AudioHandler> = Arc::new(CountingHandler {
+            init_calls: Arc::new(AtomicUsize::new(0)),
+            processed: Arc::new(AtomicUsize::new(0)),
+            flushed: Arc::new(AtomicUsize::new(0)),
+        });
+
+        receive_loop(
+            server_stream,
+            &[1u8; 32],
+            OutputConfig {
+                sample_rate: None,
+                max_channels: None,
+            },
+            Arc::clone(&state),
+            &handler,
+        )
+        .await;
+        client.await.unwrap();
+
+        let (lock, _) = &*state;
+        let s = lock.lock().unwrap();
+        assert!(s.stopped);
+        assert!(s.buffer.is_empty());
+    }
 }

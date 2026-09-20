@@ -140,9 +140,10 @@ fn preserves_pipelined_bytes_and_takes_them_once() {
 fn bytes_after_completion_are_retained_as_leftover() {
     let mut request = HttpRequest::new();
     request
-        .add_data_with_body_limit(b"POST /small RTSP/1.0\r\nContent-Length: 1\r\n\r\na", |_| {
-            Ok(1)
-        })
+        .add_data_with_body_limit(
+            b"POST /small RTSP/1.0\r\nContent-Length: 1\r\n\r\na",
+            |_| Ok(1),
+        )
         .unwrap();
     assert!(request.is_complete());
     assert_eq!(request.data(), Some(b"a".as_slice()));

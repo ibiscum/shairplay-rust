@@ -134,12 +134,7 @@ pub(crate) fn adts_header(packet_len: usize, rate: u32, channels: u8) -> Result<
         11025 => 10,
         8000 => 11,
         7350 => 12,
-        _ => {
-            return Err(format!(
-                "Unsupported ADTS sample rate: {} Hz",
-                rate
-            ))
-        }
+        _ => return Err(format!("Unsupported ADTS sample rate: {} Hz", rate)),
     };
     let chan_cfg = channels;
 
@@ -216,7 +211,7 @@ impl AacDecoder {
                 return Err(format!(
                     "Unsupported AAC channel count for ADTS framing: {}",
                     channels
-                ))
+                ));
             }
         };
 

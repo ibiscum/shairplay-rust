@@ -52,6 +52,10 @@ pub trait VideoSession: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use bytes::Bytes;
 
     struct NonSyncSession {
         // Cell is Send but not Sync, which is fine because VideoSession runs on one task.
@@ -69,5 +73,68 @@ mod tests {
     #[test]
     fn video_session_can_be_send_without_sync() {
         assert_send::<NonSyncSession>();
+    }
+
+    struct CountingSession {
+        seen: Arc<AtomicUsize>,
+        ended: Arc<AtomicUsize>,
+    }
+
+    impl VideoSession for CountingSession {
+        fn on_video(&mut self, _packet: VideoPacket) {
+            self.seen.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn on_video_end(&mut self) {
+            self.ended.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct CountingHandler {
+        seen: Arc<AtomicUsize>,
+        ended: Arc<AtomicUsize>,
+    }
+
+    impl VideoHandler for CountingHandler {
+        fn video_init(&self) -> Box<dyn VideoSession> {
+            Box::new(CountingSession {
+                seen: Arc::clone(&self.seen),
+                ended: Arc::clone(&self.ended),
+            })
+        }
+    }
+
+    #[test]
+    fn video_handler_creates_session_that_receives_packets() {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let ended = Arc::new(AtomicUsize::new(0));
+        let handler = CountingHandler {
+            seen: Arc::clone(&seen),
+            ended: Arc::clone(&ended),
+        };
+
+        let mut session = handler.video_init();
+        session.on_video(VideoPacket {
+            kind: PacketKind::Payload,
+            timestamp: 123,
+            payload: Bytes::from_static(b"hello"),
+        });
+        session.on_video_end();
+
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+        assert_eq!(ended.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn video_packet_fields_are_preserved() {
+        let packet = VideoPacket {
+            kind: PacketKind::HvcC,
+            timestamp: 0x0102_0304_0506_0708,
+            payload: Bytes::from_static(b"hvcc"),
+        };
+
+        assert_eq!(packet.kind, PacketKind::HvcC);
+        assert_eq!(packet.timestamp, 0x0102_0304_0506_0708);
+        assert_eq!(packet.payload.as_ref(), b"hvcc");
     }
 }

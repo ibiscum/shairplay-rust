@@ -446,12 +446,8 @@ pub(crate) fn handle_set_parameter(
                 }
             } else if let Some(rest) = text.strip_prefix("progress: ") {
                 let mut parts = rest.trim().split('/');
-                if let (Some(start), Some(current), Some(end), None) = (
-                    parts.next(),
-                    parts.next(),
-                    parts.next(),
-                    parts.next(),
-                )
+                if let (Some(start), Some(current), Some(end), None) =
+                    (parts.next(), parts.next(), parts.next(), parts.next())
                     && let (Ok(start), Ok(current), Ok(end)) = (
                         start.parse::<u32>(),
                         current.parse::<u32>(),
@@ -632,5 +628,230 @@ mod tests {
 
         assert!(out.is_none());
         assert!(handler.progress.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "ap2"))]
+mod ap2_tests {
+    use super::*;
+    use crate::crypto::pairing::Pairing;
+    use crate::crypto::rsa::RsaKey;
+    use crate::proto::http::{HttpRequest, HttpResponse};
+    use crate::raop::connection::RaopShared;
+    use crate::raop::hls::HlsState;
+    use crate::raop::{AudioFormat, AudioHandler, AudioSession, MemoryPairingStore};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct RecordingHandler {
+        volumes: Mutex<Vec<f32>>,
+        progress: Mutex<Vec<(u32, u32, u32)>>,
+        coverart_sizes: Mutex<Vec<usize>>,
+        metadata_calls: Mutex<usize>,
+    }
+
+    impl AudioHandler for RecordingHandler {
+        fn audio_init(&self, _format: AudioFormat) -> Box<dyn AudioSession> {
+            unreachable!("audio_init is not used in these handler tests")
+        }
+
+        fn on_volume(&self, volume: f32) {
+            self.volumes.lock().unwrap().push(volume);
+        }
+
+        fn on_progress(&self, start: u32, current: u32, end: u32) {
+            self.progress.lock().unwrap().push((start, current, end));
+        }
+
+        fn on_coverart(&self, coverart: &[u8]) {
+            self.coverart_sizes.lock().unwrap().push(coverart.len());
+        }
+
+        fn on_metadata(&self, _metadata: &crate::proto::dmap::TrackMetadata) {
+            *self.metadata_calls.lock().unwrap() += 1;
+        }
+    }
+
+    fn test_connection(handler: Arc<RecordingHandler>, local_addr: Vec<u8>) -> RaopConnection {
+        let shared = Arc::new(RaopShared {
+            rsakey: Arc::new(RsaKey::from_pem(include_str!("../../airport.key")).unwrap()),
+            pairing: Arc::new(Pairing::generate().unwrap()),
+            hwaddr: vec![0, 1, 2, 3, 4, 5],
+            password: String::new(),
+            #[cfg(feature = "pipewire-auth-setup-compat")]
+            pipewire_auth_setup_compat: false,
+            handler,
+            pairing_store: Arc::new(MemoryPairingStore::default()),
+            identity_seed: [2u8; 32],
+            output_sample_rate: None,
+            output_max_channels: None,
+            pin: None,
+            #[cfg(feature = "video")]
+            video_handler: None,
+            #[cfg(feature = "video")]
+            video_ekey: Arc::new(std::sync::RwLock::new(None)),
+            #[cfg(feature = "video")]
+            video_eiv: Arc::new(std::sync::RwLock::new(None)),
+            pairing_id: "pairing-id".into(),
+            device_id: "00:01:02:03:04:05".into(),
+            airplay_name: "test-airplay".into(),
+            active_audio: Mutex::new(None),
+            #[cfg(feature = "hls")]
+            hls_handler: None,
+        });
+
+        RaopConnection {
+            raop_rtp: None,
+            fairplay: FairPlay::new(),
+            pairing: shared.pairing.create_session(),
+            local_addr,
+            remote_addr: vec![127, 0, 0, 1],
+            remote_socket: "127.0.0.1:5000".parse().unwrap(),
+            nonce: String::new(),
+            shared,
+            srp_server: None,
+            pair_verify: None,
+            ap2_shared_secret: None,
+            pair_verify_secret: None,
+            is_ap2: true,
+            playout_cmd: None,
+            event_sender: None,
+            #[cfg(feature = "video")]
+            ekey: None,
+            #[cfg(feature = "video")]
+            eiv: None,
+            #[cfg(feature = "hls")]
+            hls_state: HlsState::new(),
+        }
+    }
+
+    fn request_with_body(method: &str, url: &str, content_type: &str, body: &[u8]) -> HttpRequest {
+        let mut req = HttpRequest::new();
+        let mut msg = format!(
+            "{method} {url} RTSP/1.0\r\nCSeq: 1\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        msg.extend_from_slice(body);
+        req.add_data(&msg).unwrap();
+        req
+    }
+
+    #[test]
+    fn local_ip_from_and_ip_from_bytes_support_v4_and_v6() {
+        let handler = Arc::new(RecordingHandler::default());
+        let conn_v4 = test_connection(handler.clone(), vec![192, 168, 0, 10]);
+        assert_eq!(local_ip_from(&conn_v4).to_string(), "192.168.0.10");
+
+        let conn_v6 = test_connection(
+            handler,
+            "2001:db8::1"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+                .to_vec(),
+        );
+        assert_eq!(local_ip_from(&conn_v6), ip_from_bytes(&conn_v6.local_addr));
+    }
+
+    #[test]
+    fn bind_addr_for_link_local_v6_falls_back_to_unspecified() {
+        let handler = Arc::new(RecordingHandler::default());
+        let conn = test_connection(
+            handler,
+            "fe80::1"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+                .to_vec(),
+        );
+        let bind = bind_addr_for(&conn);
+        assert_eq!(bind.ip(), std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED));
+        assert_eq!(bind.port(), 0);
+    }
+
+    #[test]
+    fn handle_options_ap2_includes_flushbuffered() {
+        let handler = Arc::new(RecordingHandler::default());
+        let mut conn = test_connection(handler, vec![127, 0, 0, 1]);
+        let req = request_with_body("OPTIONS", "*", "text/plain", b"");
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+
+        assert!(handle_options(&mut conn, &req, &mut resp).is_none());
+        let wire = String::from_utf8(resp.get_data().to_vec()).unwrap();
+        assert!(wire.contains("FLUSHBUFFERED"));
+        assert!(wire.contains("ANNOUNCE"));
+    }
+
+    #[test]
+    fn handle_get_parameter_returns_volume_payload_for_text_parameters() {
+        let handler = Arc::new(RecordingHandler::default());
+        let mut conn = test_connection(handler, vec![127, 0, 0, 1]);
+        let req = request_with_body("GET_PARAMETER", "*", "text/parameters", b"volume\r\n");
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+
+        let body = handle_get_parameter(&mut conn, &req, &mut resp).expect("volume body");
+        assert_eq!(body, b"volume: 0.000000\r\n");
+        let wire = String::from_utf8(resp.get_data().to_vec()).unwrap();
+        assert!(wire.contains("Content-Type: text/parameters"));
+    }
+
+    #[test]
+    fn handle_set_parameter_dispatches_volume_progress_coverart_and_metadata() {
+        let handler = Arc::new(RecordingHandler::default());
+        let mut conn = test_connection(handler.clone(), vec![127, 0, 0, 1]);
+
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+        let req_volume = request_with_body(
+            "SET_PARAMETER",
+            "*",
+            "text/parameters",
+            b"volume: -18.5\r\n",
+        );
+        assert!(handle_set_parameter(&mut conn, &req_volume, &mut resp).is_none());
+
+        let req_progress = request_with_body(
+            "SET_PARAMETER",
+            "*",
+            "text/parameters",
+            b"progress: 1/2/3\r\n",
+        );
+        assert!(handle_set_parameter(&mut conn, &req_progress, &mut resp).is_none());
+
+        let req_bad_progress = request_with_body(
+            "SET_PARAMETER",
+            "*",
+            "text/parameters",
+            b"progress: x/2/3\r\n",
+        );
+        assert!(handle_set_parameter(&mut conn, &req_bad_progress, &mut resp).is_none());
+
+        let req_coverart = request_with_body("SET_PARAMETER", "*", "image/png", b"PNGDATA");
+        assert!(handle_set_parameter(&mut conn, &req_coverart, &mut resp).is_none());
+
+        let req_meta = request_with_body(
+            "SET_PARAMETER",
+            "*",
+            "application/x-dmap-tagged",
+            b"dmappayload",
+        );
+        assert!(handle_set_parameter(&mut conn, &req_meta, &mut resp).is_none());
+
+        assert_eq!(handler.volumes.lock().unwrap().as_slice(), &[-18.5]);
+        assert_eq!(handler.progress.lock().unwrap().as_slice(), &[(1, 2, 3)]);
+        assert_eq!(handler.coverart_sizes.lock().unwrap().as_slice(), &[7]);
+        assert_eq!(*handler.metadata_calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn handle_record_adds_audio_latency_header() {
+        let handler = Arc::new(RecordingHandler::default());
+        let mut conn = test_connection(handler, vec![127, 0, 0, 1]);
+        let req = request_with_body("RECORD", "*", "text/plain", b"");
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+
+        assert!(handle_record(&mut conn, &req, &mut resp).is_none());
+        let wire = String::from_utf8(resp.get_data().to_vec()).unwrap();
+        assert!(wire.contains("Audio-Latency: 0"));
     }
 }

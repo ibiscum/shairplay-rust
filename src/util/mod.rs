@@ -74,7 +74,10 @@ mod tests {
     fn nanos_u128_to_u64_saturates() {
         assert_eq!(nanos_u128_to_u64_saturating(123), 123);
         assert_eq!(nanos_u128_to_u64_saturating(u64::MAX as u128), u64::MAX);
-        assert_eq!(nanos_u128_to_u64_saturating((u64::MAX as u128) + 1), u64::MAX);
+        assert_eq!(
+            nanos_u128_to_u64_saturating((u64::MAX as u128) + 1),
+            u64::MAX
+        );
         assert_eq!(nanos_u128_to_u64_saturating(u128::MAX), u64::MAX);
     }
 }

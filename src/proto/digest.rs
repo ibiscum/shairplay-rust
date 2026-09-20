@@ -173,14 +173,7 @@ mod tests {
             "digest username = \"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{response}\""
         );
 
-        assert!(is_valid(
-            realm,
-            password,
-            nonce,
-            method,
-            uri,
-            Some(&auth)
-        ));
+        assert!(is_valid(realm, password, nonce, method, uri, Some(&auth)));
     }
 
     #[test]
@@ -202,14 +195,7 @@ mod tests {
             "Digest username=\"{username}\",realm=\"{realm}\",nonce=\"{nonce}\",uri=\"{uri}\",response=\"{response}\""
         );
 
-        assert!(is_valid(
-            realm,
-            password,
-            nonce,
-            method,
-            uri,
-            Some(&auth)
-        ));
+        assert!(is_valid(realm, password, nonce, method, uri, Some(&auth)));
     }
 
     #[test]
