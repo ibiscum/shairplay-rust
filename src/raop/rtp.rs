@@ -60,6 +60,10 @@ fn bind_tcp(addr: SocketAddr) -> Result<TcpListener, ShairplayError> {
         .map_err(Into::into)
 }
 
+fn peer_ip_matches(expected: SocketAddr, sender: SocketAddr) -> bool {
+    sender.ip() == expected.ip()
+}
+
 /// Parse the SDP `c=` remote address to raw IP bytes for DACP callbacks.
 /// Handles "IP6 ::1" prefix and IPv4-mapped IPv6 addresses.
 pub(crate) fn remote_addr_bytes(remote: &str) -> Vec<u8> {
@@ -253,6 +257,7 @@ impl RaopRtp {
 
             let buffer = self.buffer.clone();
             let state = self.state.clone();
+            let remote_socket = self.remote_socket;
             // If control_rport is 0, the iPhone doesn't support retransmits.
             let no_resend = control_rport == 0;
             let _remote_for_task = self.remote.clone();
@@ -275,7 +280,8 @@ impl RaopRtp {
                     tokio::select! {
                         // Data channel: audio RTP packets.
                         result = dsock.recv_from(&mut data_packet) => {
-                            if let Ok((len, _)) = result
+                            if let Ok((len, addr)) = result
+                                && peer_ip_matches(remote_socket, addr)
                                 && len >= 12 {
                                     let mut buf = buffer.lock().await;
                                     buf.queue(&data_packet[..len], true);
@@ -296,7 +302,8 @@ impl RaopRtp {
                         }
                         // Control channel: retransmit responses (payload type 0x56).
                         result = csock.recv_from(&mut ctrl_packet) => {
-                            if let Ok((len, _)) = result
+                            if let Ok((len, addr)) = result
+                                && peer_ip_matches(remote_socket, addr)
                                 && len >= 12 && (ctrl_packet[1] & !0x80) == CTRL_PAYLOAD_TYPE {
                                     let mut buf = buffer.lock().await;
                                     // Retransmit packets have a 4-byte header before the original RTP.
@@ -385,18 +392,16 @@ impl RaopRtp {
                                 if packet_buf.len() < 4 + rtp_len { break; }
                                 let mut buf = buffer.lock().await;
                                 buf.queue(&packet_buf[4..4 + rtp_len], false);
-                                if let Some(samples) = buf.dequeue(true) {
-                                    {
-                                            #[cfg(feature = "resample")]
-                                            if let Some(ref mut rs) = resampler {
-                                                let resampled = rs.process(samples);
-                                                session.audio_process(&resampled);
-                                            } else {
-                                                session.audio_process(samples);
-                                            }
-                                            #[cfg(not(feature = "resample"))]
-                                            session.audio_process(samples);
-                                        }
+                                while let Some(samples) = buf.dequeue(true) {
+                                    #[cfg(feature = "resample")]
+                                    if let Some(ref mut rs) = resampler {
+                                        let resampled = rs.process(samples);
+                                        session.audio_process(&resampled);
+                                    } else {
+                                        session.audio_process(samples);
+                                    }
+                                    #[cfg(not(feature = "resample"))]
+                                    session.audio_process(samples);
                                 }
                                 drop(buf);
                                 packet_buf.drain(..4 + rtp_len);
@@ -425,5 +430,24 @@ impl RaopRtp {
             let _ = tx.send(true);
         }
         self.flush(-1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_ip_matches_accepts_same_ip_different_port() {
+        let expected: SocketAddr = "192.168.1.10:6000".parse().unwrap();
+        let sender: SocketAddr = "192.168.1.10:7000".parse().unwrap();
+        assert!(peer_ip_matches(expected, sender));
+    }
+
+    #[test]
+    fn peer_ip_matches_rejects_different_ip() {
+        let expected: SocketAddr = "192.168.1.10:6000".parse().unwrap();
+        let sender: SocketAddr = "192.168.1.11:6000".parse().unwrap();
+        assert!(!peer_ip_matches(expected, sender));
     }
 }

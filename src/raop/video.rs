@@ -41,10 +41,33 @@ pub trait VideoHandler: Send + Sync + 'static {
 /// Per-stream video session receiving decrypted video packets.
 ///
 /// Created by [`VideoHandler::video_init`]. Dropped when the stream ends.
-pub trait VideoSession: Send + Sync {
+pub trait VideoSession: Send {
     /// Called for each decrypted video packet.
     fn on_video(&mut self, packet: VideoPacket);
 
     /// Called when the video stream ends (client disconnected or error).
     fn on_video_end(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NonSyncSession {
+        // Cell is Send but not Sync, which is fine because VideoSession runs on one task.
+        seen: std::cell::Cell<u32>,
+    }
+
+    impl VideoSession for NonSyncSession {
+        fn on_video(&mut self, _packet: VideoPacket) {
+            self.seen.set(self.seen.get().saturating_add(1));
+        }
+    }
+
+    fn assert_send<T: Send>() {}
+
+    #[test]
+    fn video_session_can_be_send_without_sync() {
+        assert_send::<NonSyncSession>();
+    }
 }

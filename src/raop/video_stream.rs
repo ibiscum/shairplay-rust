@@ -25,6 +25,10 @@ struct VideoHeader {
     timestamp: u64,
 }
 
+fn peer_ip_matches(expected: std::net::IpAddr, actual: std::net::SocketAddr) -> bool {
+    expected == actual.ip()
+}
+
 fn parse_header(header: &[u8; VIDEO_HEADER_LEN]) -> VideoHeader {
     VideoHeader {
         payload_len: u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize,
@@ -63,14 +67,21 @@ async fn read_with_timeout(stream: &mut TcpStream, buffer: &mut [u8], part: &str
 /// Run the video stream receiver. Accepts one TCP connection and processes packets.
 pub(crate) async fn run(
     listener: TcpListener,
+    expected_peer_ip: std::net::IpAddr,
     cipher: VideoCipher,
     session: Box<dyn VideoSession>,
 ) {
-    let (stream, addr) = match listener.accept().await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Video stream accept failed: {e}");
-            return;
+    let (stream, addr) = loop {
+        match listener.accept().await {
+            Ok((stream, addr)) if peer_ip_matches(expected_peer_ip, addr) => break (stream, addr),
+            Ok((_, addr)) => {
+                warn!(%addr, expected = %expected_peer_ip, "Video stream connection from unexpected peer");
+                continue;
+            }
+            Err(e) => {
+                warn!("Video stream accept failed: {e}");
+                return;
+            }
         }
     };
     info!(%addr, "Video stream client connected");
@@ -149,5 +160,19 @@ mod tests {
         assert_eq!(classify_packet(4096, b""), PacketKind::Payload);
         assert_eq!(classify_packet(5, b""), PacketKind::Plist);
         assert_eq!(classify_packet(42, b""), PacketKind::Other(42));
+    }
+
+    #[test]
+    fn peer_ip_matches_accepts_same_ip() {
+        let expected: std::net::IpAddr = "192.168.1.10".parse().unwrap();
+        let actual: std::net::SocketAddr = "192.168.1.10:7000".parse().unwrap();
+        assert!(peer_ip_matches(expected, actual));
+    }
+
+    #[test]
+    fn peer_ip_matches_rejects_different_ip() {
+        let expected: std::net::IpAddr = "192.168.1.10".parse().unwrap();
+        let actual: std::net::SocketAddr = "192.168.1.11:7000".parse().unwrap();
+        assert!(!peer_ip_matches(expected, actual));
     }
 }

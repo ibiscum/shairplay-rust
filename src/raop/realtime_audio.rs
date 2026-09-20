@@ -17,6 +17,7 @@ use crate::raop::{AudioCodec, AudioFormat, AudioHandler};
 use crate::codec::resample::StreamResampler;
 
 /// Output configuration for resampling/mixdown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OutputConfig {
     /// Source sample rate from the stream SETUP.
     pub(crate) source_sample_rate: u32,
@@ -30,6 +31,29 @@ pub(crate) struct OutputConfig {
     pub(crate) sample_rate: Option<u32>,
     /// Maximum output channels, or None to pass through.
     pub(crate) max_channels: Option<u8>,
+}
+
+fn normalize_output_config(config: &OutputConfig) -> OutputConfig {
+    OutputConfig {
+        source_sample_rate: if config.source_sample_rate == 0 {
+            44_100
+        } else {
+            config.source_sample_rate
+        },
+        samples_per_frame: if config.samples_per_frame == 0 {
+            352
+        } else {
+            config.samples_per_frame
+        },
+        channels: if config.channels == 0 { 2 } else { config.channels },
+        bit_depth: if config.bit_depth == 0 {
+            16
+        } else {
+            config.bit_depth
+        },
+        sample_rate: config.sample_rate.filter(|&r| r > 0),
+        max_channels: config.max_channels.filter(|&c| c > 0),
+    }
 }
 
 fn alac_decoder_info(config: &OutputConfig) -> [u8; 48] {
@@ -54,6 +78,15 @@ pub(crate) async fn run(
 ) {
     let cipher = ChaCha20Poly1305::new((&shk).into());
     let mut buf = vec![0u8; 4096];
+    let normalized_output_config = normalize_output_config(&output_config);
+    if normalized_output_config != output_config {
+        warn!(
+            ?output_config,
+            normalized = ?normalized_output_config,
+            "Realtime audio setup contained invalid zero values; using safe defaults"
+        );
+    }
+    let output_config = normalized_output_config;
     let mut decoder: Option<crate::codec::alac::AlacDecoder> = None;
     #[cfg(feature = "resample")]
     let mut resampler: Option<StreamResampler> = None;
@@ -168,5 +201,44 @@ mod tests {
         assert_eq!(info[33], 2);
         assert_eq!(u16::from_be_bytes(info[34..36].try_into().unwrap()), 255);
         assert_eq!(u32::from_be_bytes(info[44..48].try_into().unwrap()), 48_000);
+    }
+
+    #[test]
+    fn normalize_output_config_sanitizes_zero_values() {
+        let cfg = normalize_output_config(&OutputConfig {
+            source_sample_rate: 0,
+            samples_per_frame: 0,
+            channels: 0,
+            bit_depth: 0,
+            sample_rate: Some(0),
+            max_channels: Some(0),
+        });
+
+        assert_eq!(
+            cfg,
+            OutputConfig {
+                source_sample_rate: 44_100,
+                samples_per_frame: 352,
+                channels: 2,
+                bit_depth: 16,
+                sample_rate: None,
+                max_channels: None,
+            }
+        );
+    }
+
+    #[test]
+    fn normalize_output_config_preserves_valid_values() {
+        let original = OutputConfig {
+            source_sample_rate: 48_000,
+            samples_per_frame: 480,
+            channels: 6,
+            bit_depth: 24,
+            sample_rate: Some(96_000),
+            max_channels: Some(2),
+        };
+
+        let cfg = normalize_output_config(&original);
+        assert_eq!(cfg, original);
     }
 }

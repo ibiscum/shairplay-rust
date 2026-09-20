@@ -177,11 +177,16 @@ pub trait PairingStore: Send + Sync + 'static {
     fn save_identity(&self, _seed: [u8; 32]) {}
 }
 
-/// In-memory pairing store (lost on restart). Use for testing or wrap with file I/O.
+/// In-memory pairing store (lost on process restart).
+///
+/// Stores paired controller keys and the accessory identity seed in memory for
+/// the lifetime of this object. Use for testing or wrap with file I/O for
+/// persistence across restarts.
 #[cfg(feature = "ap2")]
 #[derive(Default)]
 pub struct MemoryPairingStore {
     keys: std::sync::Mutex<std::collections::HashMap<String, [u8; 32]>>,
+    identity_seed: std::sync::Mutex<Option<[u8; 32]>>,
 }
 
 #[cfg(feature = "ap2")]
@@ -196,6 +201,14 @@ impl PairingStore for MemoryPairingStore {
     }
     fn has_any_pairing(&self) -> bool {
         self.keys.lock().map(|k| !k.is_empty()).unwrap_or(false)
+    }
+    fn load_identity(&self) -> Option<[u8; 32]> {
+        self.identity_seed.lock().ok().and_then(|seed| *seed)
+    }
+    fn save_identity(&self, seed: [u8; 32]) {
+        if let Ok(mut identity_seed) = self.identity_seed.lock() {
+            *identity_seed = Some(seed);
+        }
     }
     fn remove(&self, device_id: &str) {
         if let Ok(mut keys) = self.keys.lock() {

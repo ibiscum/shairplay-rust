@@ -349,11 +349,27 @@ fn resolve_record(conn: &RaopConnection) -> Option<Handler> {
     Some(handlers::handle_record)
 }
 
+fn parse_rtp_info_seq(rtp_info: &str) -> Option<i32> {
+    for token in rtp_info.split([',', ';']) {
+        let token = token.trim();
+        let Some((key, value)) = token.split_once('=') else {
+            continue;
+        };
+        if key.eq_ignore_ascii_case("seq") {
+            let seq = value.trim().parse::<i32>().ok()?;
+            if seq >= 0 {
+                return Some(seq);
+            }
+            return None;
+        }
+    }
+    None
+}
+
 /// FLUSH: parse RTP-Info header and flush the buffer inline.
 fn handle_flush_inline(conn: &mut RaopConnection, request: &HttpRequest) {
     if let Some(rtp_info) = request.header("RTP-Info")
-        && let Some(seq_str) = rtp_info.strip_prefix("seq=")
-        && let Ok(next_seq) = seq_str.parse::<i32>()
+        && let Some(next_seq) = parse_rtp_info_seq(rtp_info)
         && let Some(rtp) = &conn.raop_rtp
     {
         rtp.flush(next_seq);
@@ -376,4 +392,27 @@ fn handle_teardown(
         let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::Stop);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_rtp_info_seq_accepts_simple_and_mixed_order() {
+        assert_eq!(parse_rtp_info_seq("seq=1234"), Some(1234));
+        assert_eq!(
+            parse_rtp_info_seq("rtptime=4242; seq=987;foo=bar"),
+            Some(987)
+        );
+        assert_eq!(parse_rtp_info_seq("foo=1,seq=77"), Some(77));
+    }
+
+    #[test]
+    fn parse_rtp_info_seq_rejects_invalid_or_negative_values() {
+        assert_eq!(parse_rtp_info_seq("rtptime=4242"), None);
+        assert_eq!(parse_rtp_info_seq("seq="), None);
+        assert_eq!(parse_rtp_info_seq("seq=abc"), None);
+        assert_eq!(parse_rtp_info_seq("seq=-1"), None);
+    }
 }

@@ -243,6 +243,44 @@ fn builder_rejects_invalid_hwaddr_length() {
     ));
 }
 
+#[test]
+fn builder_rejects_zero_max_clients() {
+    let result = RaopServer::builder()
+        .name("ZeroMaxClients")
+        .port(0)
+        .max_clients(0)
+        .build(empty_handler());
+
+    assert!(matches!(
+        result,
+        Err(shairplay::ShairplayError::Server(
+            shairplay::error::ServerError::MaxClients(0)
+        ))
+    ));
+}
+
+#[test]
+fn builder_rejects_zero_output_sample_rate() {
+    let result = RaopServer::builder()
+        .name("ZeroOutputSampleRate")
+        .port(0)
+        .output_sample_rate(0)
+        .build(empty_handler());
+
+    assert_invalid_configuration(result, "output_sample_rate must be greater than 0");
+}
+
+#[test]
+fn builder_rejects_zero_output_max_channels() {
+    let result = RaopServer::builder()
+        .name("ZeroOutputMaxChannels")
+        .port(0)
+        .output_max_channels(0)
+        .build(empty_handler());
+
+    assert_invalid_configuration(result, "output_max_channels must be greater than 0");
+}
+
 #[cfg(feature = "diagnostic-headers")]
 #[test]
 fn builder_accepts_redacted_header_diagnostics() {

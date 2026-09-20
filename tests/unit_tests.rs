@@ -817,8 +817,8 @@ fn pairing_store_identity_methods_default_and_roundtrip() {
     // implement them still compiles and reports "no persisted identity".
     let mem = MemoryPairingStore::default();
     assert_eq!(mem.load_identity(), None);
-    mem.save_identity([9u8; 32]); // default no-op
-    assert_eq!(mem.load_identity(), None);
+    mem.save_identity([9u8; 32]);
+    assert_eq!(mem.load_identity(), Some([9u8; 32]));
 
     // A store that implements the methods round-trips the seed.
     struct Store(std::sync::Mutex<Option<[u8; 32]>>);

@@ -29,8 +29,8 @@ pub enum ShairplayError {
 /// Errors from the AirPlay server and session handling.
 #[derive(Debug, Error)]
 pub enum ServerError {
-    /// Maximum number of concurrent clients reached.
-    #[error("max clients reached ({0})")]
+    /// Invalid maximum number of concurrent clients configured.
+    #[error("invalid max clients: {0}")]
     MaxClients(usize),
 
     /// Hardware address has invalid length (expected 6 bytes).

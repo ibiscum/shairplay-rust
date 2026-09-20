@@ -280,6 +280,18 @@ impl RaopServerBuilder {
         {
             return Err(ServerError::InvalidPassword(password.len()).into());
         }
+        if matches!(self.output_sample_rate, Some(0)) {
+            return Err(ServerError::InvalidConfiguration(
+                "output_sample_rate must be greater than 0",
+            )
+            .into());
+        }
+        if matches!(self.output_max_channels, Some(0)) {
+            return Err(ServerError::InvalidConfiguration(
+                "output_max_channels must be greater than 0",
+            )
+            .into());
+        }
         #[cfg(feature = "ap2")]
         if self.mode == AirPlayMode::AirPlay2
             && (self.ap1_codecs.is_some() || self.ap1_encryption.is_some())

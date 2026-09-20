@@ -2,16 +2,22 @@
 
 use std::fmt::Write;
 
+#[cfg(feature = "ap2")]
+fn nanos_u128_to_u64_saturating(nanos: u128) -> u64 {
+    nanos.min(u64::MAX as u128) as u64
+}
+
 /// Current wall-clock time in nanoseconds since the UNIX epoch.
 ///
 /// Saturates to 0 if the clock is before the epoch. Used by the AP2 audio
 /// playout scheduler and PTP timing code.
 #[cfg(feature = "ap2")]
 pub fn now_ns() -> u64 {
-    std::time::SystemTime::now()
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos() as u64
+        .as_nanos();
+    nanos_u128_to_u64_saturating(nanos)
 }
 
 /// Format a hardware address for RAOP service name: "AABBCCDDEEFF" (uppercase hex, no separators).
@@ -55,5 +61,20 @@ mod tests {
             hwaddr_airplay(&[0x48, 0x5d, 0x60, 0x7c, 0xee, 0x22]),
             "48:5d:60:7c:ee:22"
         );
+    }
+
+    #[test]
+    fn hwaddr_formatting_empty_input() {
+        assert_eq!(hwaddr_raop(&[]), "");
+        assert_eq!(hwaddr_airplay(&[]), "");
+    }
+
+    #[cfg(feature = "ap2")]
+    #[test]
+    fn nanos_u128_to_u64_saturates() {
+        assert_eq!(nanos_u128_to_u64_saturating(123), 123);
+        assert_eq!(nanos_u128_to_u64_saturating(u64::MAX as u128), u64::MAX);
+        assert_eq!(nanos_u128_to_u64_saturating((u64::MAX as u128) + 1), u64::MAX);
+        assert_eq!(nanos_u128_to_u64_saturating(u128::MAX), u64::MAX);
     }
 }

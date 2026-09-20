@@ -942,7 +942,13 @@ fn setup_stream_video(
 
     if let Some(vh) = &conn.shared.video_handler {
         let session = vh.video_init();
-        tokio::spawn(crate::raop::video_stream::run(listener, cipher, session));
+        let expected_peer_ip = conn.remote_socket.ip();
+        tokio::spawn(crate::raop::video_stream::run(
+            listener,
+            expected_peer_ip,
+            cipher,
+            session,
+        ));
     }
 
     stream_resp.insert("dataPort".into(), plist::Value::Integer(video_port.into()));
