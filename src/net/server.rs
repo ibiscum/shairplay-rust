@@ -469,6 +469,14 @@ async fn ingest_encrypted_data<S: AsyncWrite + Unpin>(
         );
         return false;
     }
+    if consumed == 0 && !plain.is_empty() {
+        tracing::warn!(
+            plain_len = plain.len(),
+            raw_len = raw_buf.len(),
+            "Decryptor produced plaintext without consuming input"
+        );
+        return false;
+    }
     tracing::trace!(plain_len = plain.len(), consumed, "Decrypted request data");
     raw_buf.drain(..consumed);
     plain.is_empty() || add_request_data(stream, handler, request, &plain, config).await
@@ -674,6 +682,38 @@ mod tests {
         let task = tokio::spawn(process_connection(
             server,
             Box::new(InvalidConsumptionHandler),
+            remote,
+            ConnectionConfig::default(),
+        ));
+
+        client.write_all(b"encrypted").await.unwrap();
+        drop(client);
+        task.await.unwrap();
+    }
+
+    struct ZeroConsumptionWithPlainHandler;
+
+    impl ConnectionHandler for ZeroConsumptionWithPlainHandler {
+        fn conn_request(&mut self, _req: &HttpRequest) -> HttpResponse {
+            unreachable!("invalid decryptor output must not reach request dispatch")
+        }
+
+        fn decrypt_incoming(&mut self, _data: &[u8]) -> Option<(Vec<u8>, usize)> {
+            Some((b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n".to_vec(), 0))
+        }
+
+        fn is_encrypted(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_plaintext_without_consumption_without_panicking() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let remote: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let task = tokio::spawn(process_connection(
+            server,
+            Box::new(ZeroConsumptionWithPlainHandler),
             remote,
             ConnectionConfig::default(),
         ));

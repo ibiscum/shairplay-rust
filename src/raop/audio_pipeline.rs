@@ -6,6 +6,8 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce, aead::Aead, aead::Payload};
 
 /// RTP fixed header length (bytes).
 pub(crate) const RTP_HEADER_LEN: usize = 12;
+/// ChaCha20-Poly1305 authentication tag length (bytes).
+pub(crate) const CHACHA_TAG_LEN: usize = 16;
 /// Trailing per-packet nonce length appended after the ciphertext (bytes).
 pub(crate) const NONCE_TRAIL_LEN: usize = 8;
 
@@ -17,16 +19,17 @@ pub(crate) const NONCE_TRAIL_LEN: usize = 8;
 /// contain a header + tail or the authentication tag fails.
 pub fn decrypt_rtp_chacha(cipher: &ChaCha20Poly1305, packet: &[u8]) -> Option<Vec<u8>> {
     let pkt_len = packet.len();
-    if pkt_len <= RTP_HEADER_LEN + NONCE_TRAIL_LEN {
+    if pkt_len < RTP_HEADER_LEN + CHACHA_TAG_LEN + NONCE_TRAIL_LEN {
         return None;
     }
     let mut nonce = [0u8; 12];
     nonce[4..12].copy_from_slice(&packet[pkt_len - NONCE_TRAIL_LEN..]);
+    let nonce = Nonce::try_from(&nonce[..]).ok()?;
     let aad = &packet[4..12];
     let ciphertext = &packet[RTP_HEADER_LEN..pkt_len - NONCE_TRAIL_LEN];
     cipher
         .decrypt(
-            Nonce::from_slice(&nonce),
+            &nonce,
             Payload {
                 msg: ciphertext,
                 aad,
@@ -48,9 +51,10 @@ mod tests {
     ) -> Vec<u8> {
         let mut nonce = [0u8; 12];
         nonce[4..12].copy_from_slice(&nonce_tail);
+        let nonce = Nonce::try_from(&nonce[..]).unwrap();
         let ct = cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                &nonce,
                 Payload {
                     msg: plaintext,
                     aad: &header[4..12],
@@ -77,10 +81,19 @@ mod tests {
     #[test]
     fn decrypt_rtp_chacha_rejects_short_and_tampered() {
         let cipher = ChaCha20Poly1305::new((&[7u8; 32]).into());
-        assert!(decrypt_rtp_chacha(&cipher, &[0u8; RTP_HEADER_LEN + NONCE_TRAIL_LEN]).is_none());
+        assert!(decrypt_rtp_chacha(&cipher, &[0u8; RTP_HEADER_LEN + CHACHA_TAG_LEN + NONCE_TRAIL_LEN - 1]).is_none());
         let header = [0x80, 0x60, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3];
         let mut pkt = encrypt_frame(&cipher, header, [9u8; 8], b"payload");
         pkt[RTP_HEADER_LEN] ^= 0xff; // corrupt ciphertext → tag fails
         assert!(decrypt_rtp_chacha(&cipher, &pkt).is_none());
+
+        let mut aad_tampered = encrypt_frame(&cipher, header, [9u8; 8], b"payload");
+        aad_tampered[4] ^= 0x01; // AAD byte participates in tag
+        assert!(decrypt_rtp_chacha(&cipher, &aad_tampered).is_none());
+
+        let mut nonce_tampered = encrypt_frame(&cipher, header, [9u8; 8], b"payload");
+        let tail_start = nonce_tampered.len() - NONCE_TRAIL_LEN;
+        nonce_tampered[tail_start] ^= 0x01; // nonce mismatch → tag fails
+        assert!(decrypt_rtp_chacha(&cipher, &nonce_tampered).is_none());
     }
 }

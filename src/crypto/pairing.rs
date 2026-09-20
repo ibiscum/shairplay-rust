@@ -1,7 +1,6 @@
 //! Ed25519/Curve25519 pair-setup and pair-verify for AP1.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand::rngs::OsRng;
 use sha2::{Digest, Sha512};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
@@ -19,8 +18,9 @@ pub struct Pairing {
 impl Pairing {
     /// Generate a new random pairing identity. Equivalent to pairing_init_generate.
     pub fn generate() -> Result<Self, CryptoError> {
+        let seed: [u8; 32] = rand::random();
         Ok(Self {
-            signing_key: SigningKey::generate(&mut OsRng),
+            signing_key: SigningKey::from_bytes(&seed),
         })
     }
 
@@ -90,11 +90,13 @@ impl PairingSession {
 
     /// Perform the ECDH handshake. Equivalent to pairing_session_handshake.
     pub fn handshake(&mut self, ecdh_key: &[u8; 32], ed_key: &[u8; 32]) -> Result<(), CryptoError> {
-        if self.status == Status::Finished {
-            return Err(CryptoError::PairingHandshake("already finished".into()));
+        if self.status != Status::Initial {
+            return Err(CryptoError::PairingHandshake(
+                "handshake already started".into(),
+            ));
         }
 
-        let our_secret = StaticSecret::random_from_rng(OsRng);
+        let our_secret = StaticSecret::from(rand::random::<[u8; 32]>());
         let our_public = X25519PublicKey::from(&our_secret);
         let their_public = X25519PublicKey::from(*ecdh_key);
         let shared = our_secret.diffie_hellman(&their_public);
@@ -175,6 +177,11 @@ impl PairingSession {
 
     /// Derive a key from the shared secret. Equivalent to pairing_session_derive_key.
     pub fn derive_key(&self, salt: &[u8], key_len: usize) -> Result<Vec<u8>, CryptoError> {
+        if self.status == Status::Initial {
+            return Err(CryptoError::PairingHandshake(
+                "not in handshake state".into(),
+            ));
+        }
         self.derive_key_internal(salt, key_len)
     }
 }

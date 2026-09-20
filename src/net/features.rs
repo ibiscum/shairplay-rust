@@ -117,8 +117,6 @@ pub(crate) fn features_from(flags: &[AirPlayFeature]) -> u64 {
 
 /// Features for an audio-only AirPlay 2 receiver.
 ///
-/// Features for an audio-only AirPlay 2 receiver.
-///
 /// Known-good bitmask: `0x0001C340405D4A00` (matches shairport-sync).
 /// Tested working with iOS 18 on 2026-04-04.
 ///
@@ -267,17 +265,52 @@ mod tests {
 
     #[test]
     #[cfg(not(feature = "video"))]
+    fn audio_receiver_keeps_known_bad_bits_clear() {
+        let f = receiver_features();
+        // These bits are known to break audio-only interoperability; keep clear.
+        assert_eq!(f & (1 << 15), 0, "MetadataArtwork must stay off");
+        assert_eq!(f & (1 << 17), 0, "MetadataNowPlayingDaap must stay off");
+        assert_eq!(f & (1 << 23), 0, "Authentication1 must stay off");
+        assert_eq!(f & (1 << 27), 0, "SupportsLegacyPairing must stay off");
+        assert_eq!(f & (1 << 32), 0, "SupportsVolume must stay off");
+        assert_eq!(f & (1 << 49), 0, "SupportsAirPlayVideoV2 must stay off");
+        assert_eq!(f & (1 << 50), 0, "MetadataNowPlayingBplist must stay off");
+        assert_eq!(f & (1 << 52), 0, "SupportsSetPeersExtendedMessage must stay off");
+        assert_eq!(f & (1 << 59), 0, "SupportsAudioStreamConnectionSetup must stay off");
+        assert_eq!(f & (1 << 60), 0, "SupportsAudioMediaDataControl must stay off");
+        assert_eq!(f & (1 << 61), 0, "SupportsRfc2198Redundancy must stay off");
+    }
+
+    #[test]
+    #[cfg(not(feature = "video"))]
+    fn default_pairing_keeps_transient_bit() {
+        let f = receiver_features_for_pairing(false);
+        assert_ne!(f & (1 << 47), 0, "transient pairing bit must be on by default");
+    }
+
+    #[test]
+    #[cfg(not(feature = "video"))]
     fn pin_pairing_clears_transient_bit() {
-        let f = receiver_features_for_pairing(true);
-        assert_eq!(f, 0x0001_4340_405D_4A00, "PIN pairing features drifted");
-        assert!(f & (1 << 46) != 0, "SupportsHKPairing");
-        assert!(f & (1 << 48) != 0, "SupportsCoreUtilsPairing");
-        assert_eq!(f & (1 << 47), 0, "transient pairing bit must be off");
+        let default = receiver_features_for_pairing(false);
+        let pin = receiver_features_for_pairing(true);
+        assert_eq!(pin, 0x0001_4340_405D_4A00, "PIN pairing features drifted");
+        assert!(pin & (1 << 46) != 0, "SupportsHKPairing");
+        assert!(pin & (1 << 48) != 0, "SupportsCoreUtilsPairing");
+        assert_eq!(pin & (1 << 47), 0, "transient pairing bit must be off");
+        // Only transient pairing support should change in PIN-required mode.
+        assert_eq!(default ^ pin, 1u64 << 47);
     }
 
     #[test]
     #[cfg(feature = "video")]
     fn video_receiver_uses_uxplay_features() {
         assert_eq!(receiver_features(), 0x527FFEE6);
+    }
+
+    #[test]
+    #[cfg(feature = "video")]
+    fn video_receiver_ignores_pairing_mode_toggle() {
+        assert_eq!(receiver_features_for_pairing(false), 0x527FFEE6);
+        assert_eq!(receiver_features_for_pairing(true), 0x527FFEE6);
     }
 }

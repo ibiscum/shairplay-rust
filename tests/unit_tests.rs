@@ -259,6 +259,27 @@ fn pairing_derive_key_deterministic() {
     assert_eq!(k1.len(), 16);
 }
 
+#[test]
+fn pairing_derive_key_before_handshake_rejected() {
+    let p = Pairing::from_seed(&[0xAA; 32]);
+    let s = p.create_session();
+    assert!(s.derive_key(b"test-salt", 16).is_err());
+}
+
+#[test]
+fn pairing_rejects_repeated_handshake() {
+    let server = Pairing::from_seed(&[0x11; 32]);
+    let client = Pairing::from_seed(&[0x22; 32]);
+
+    let mut session = server.create_session();
+    let ecdh_a = [0x33u8; 32];
+    let ecdh_b = [0x44u8; 32];
+    let client_ed = client.public_key();
+
+    session.handshake(&ecdh_a, &client_ed).unwrap();
+    assert!(session.handshake(&ecdh_b, &client_ed).is_err());
+}
+
 // ============================================================
 // FairPlay — setup/handshake protocol
 // ============================================================

@@ -532,7 +532,8 @@ impl AlacDecoder {
         p += 1;
         self.rice_k_modifier = config[p];
         p += 1;
-        p += 1; // 7f
+        let num_channels = config[p];
+        p += 1;
         self.max_run = u16::from_be_bytes([config[p], config[p + 1]]);
         p += 2;
         self.max_frame_bytes =
@@ -543,6 +544,21 @@ impl AlacDecoder {
         p += 4;
         self.sample_rate =
             u32::from_be_bytes([config[p], config[p + 1], config[p + 2], config[p + 3]]);
+
+        // AirPlay ALAC streams are constrained to 16-bit or 24-bit and mono/stereo.
+        // Treat out-of-profile configs as disabled to avoid undefined decode behavior.
+        if !matches!(self.sample_size_config, 16 | 24) || !(1..=2).contains(&num_channels) {
+            self.max_samples_per_frame = 0;
+            self.bytes_per_sample = 0;
+            return;
+        }
+
+        self.num_channels = num_channels as i32;
+        self.bytes_per_sample = (self.sample_size_config as i32 / 8) * self.num_channels;
+
+        if self.max_samples_per_frame == 0 || self.bytes_per_sample <= 0 {
+            return;
+        }
         self.allocate_buffers();
     }
 
@@ -568,12 +584,27 @@ impl AlacDecoder {
         let channels = reader.readbits(3);
         let mut output_size = output_samples * self.bytes_per_sample as usize;
 
-        match channels {
-            0 => self.decode_mono(&mut reader, output, &mut output_samples, &mut output_size),
-            1 => self.decode_stereo(&mut reader, output, &mut output_samples, &mut output_size),
-            _ => {}
+        if output.len() < output_size {
+            return 0;
         }
-        output_size
+
+        let ok = match channels {
+            0 => {
+                if self.num_channels != 1 {
+                    return 0;
+                }
+                self.decode_mono(&mut reader, output, &mut output_samples, &mut output_size)
+            }
+            1 => {
+                if self.num_channels != 2 {
+                    return 0;
+                }
+                self.decode_stereo(&mut reader, output, &mut output_samples, &mut output_size)
+            }
+            _ => false,
+        };
+
+        if ok { output_size } else { 0 }
     }
 
     /// Decode an ALAC frame and return F32LE interleaved samples.
@@ -666,19 +697,29 @@ impl AlacDecoder {
         output: &mut [u8],
         output_samples: &mut usize,
         output_size: &mut usize,
-    ) {
+    ) -> bool {
         let (uncompressed_bytes, is_not_compressed) = parse_subframe_header(
             reader,
             output_samples,
             output_size,
             self.bytes_per_sample as usize,
         );
+        if *output_samples > self.max_samples_per_frame as usize || *output_size > output.len() {
+            *output_size = 0;
+            return false;
+        }
         if *output_samples == 0 {
             *output_size = 0;
-            return;
+            return true;
         }
 
-        let readsamplesize = self.sample_size_config as u32 - uncompressed_bytes * 8;
+        let bit_width = uncompressed_bytes * 8;
+        if bit_width > self.sample_size_config as u32 {
+            *output_size = 0;
+            return false;
+        }
+
+        let readsamplesize = self.sample_size_config as u32 - bit_width;
 
         if is_not_compressed == 0 {
             // Unused interlacing shift/leftweight (always present in the stream).
@@ -733,8 +774,10 @@ impl AlacDecoder {
                     output[off + 2] = (sample >> 16) as u8;
                 }
             }
-            _ => {}
+            _ => return false,
         }
+
+        true
     }
 
     fn decode_stereo(
@@ -743,19 +786,29 @@ impl AlacDecoder {
         output: &mut [u8],
         output_samples: &mut usize,
         output_size: &mut usize,
-    ) {
+    ) -> bool {
         let (uncompressed_bytes, is_not_compressed) = parse_subframe_header(
             reader,
             output_samples,
             output_size,
             self.bytes_per_sample as usize,
         );
+        if *output_samples > self.max_samples_per_frame as usize || *output_size > output.len() {
+            *output_size = 0;
+            return false;
+        }
         if *output_samples == 0 {
             *output_size = 0;
-            return;
+            return true;
         }
 
-        let readsamplesize = self.sample_size_config as u32 - uncompressed_bytes * 8 + 1;
+        let bit_width = uncompressed_bytes * 8;
+        if bit_width > self.sample_size_config as u32 {
+            *output_size = 0;
+            return false;
+        }
+
+        let readsamplesize = self.sample_size_config as u32 - bit_width + 1;
         let mut interlacing_shift = 0u8;
         let mut interlacing_leftweight = 0u8;
 
@@ -828,8 +881,10 @@ impl AlacDecoder {
                 },
                 output,
             ),
-            _ => {}
+            _ => return false,
         }
+
+        true
     }
 }
 
@@ -880,18 +935,27 @@ mod decode_tests {
         }
     }
 
-    /// ALACSpecificConfig with 16-bit samples and the given max frame length.
-    fn config_16(max_frames: u32) -> [u8; 48] {
+    /// ALACSpecificConfig with selected sample size/channels and frame length.
+    fn config(sample_size: u8, channels: u8, max_frames: u32) -> [u8; 48] {
         let mut c = [0u8; 48];
         c[24..28].copy_from_slice(&max_frames.to_be_bytes());
-        c[29] = 16; // sample_size_config
+        c[29] = sample_size; // sample_size_config
+        c[30] = 40; // pb
+        c[31] = 10; // mb
+        c[32] = 14; // kb
+        c[33] = channels;
+        c[34..36].copy_from_slice(&255u16.to_be_bytes()); // max run
+        c[44..48].copy_from_slice(&44_100u32.to_be_bytes());
         c
     }
 
+    /// ALACSpecificConfig with 16-bit samples and the given max frame length.
+    fn config_16(max_frames: u32, channels: u8) -> [u8; 48] {
+        config(16, channels, max_frames)
+    }
+
     fn config_24(max_frames: u32) -> [u8; 48] {
-        let mut c = config_16(max_frames);
-        c[29] = 24; // sample_size_config
-        c
+        config(24, 2, max_frames)
     }
 
     // An uncompressed ALAC subframe just sign-extends and packs the raw samples,
@@ -901,7 +965,7 @@ mod decode_tests {
     #[test]
     fn decode_uncompressed_mono_roundtrips_samples() {
         let mut dec = AlacDecoder::new(16, 1);
-        dec.set_info(&config_16(4));
+        dec.set_info(&config_16(4, 1));
 
         let samples: [u16; 4] = [0x0102, 0x7FFF, 0x8000, 0xFFFF];
         let mut w = BitWriter::new();
@@ -928,7 +992,7 @@ mod decode_tests {
     #[test]
     fn decode_uncompressed_stereo_roundtrips_samples() {
         let mut dec = AlacDecoder::new(16, 2);
-        dec.set_info(&config_16(4));
+        dec.set_info(&config_16(4, 2));
 
         let l: [u16; 4] = [0x0102, 0x7FFF, 0x8000, 0xFFFF];
         let r: [u16; 4] = [0x1111, 0x2222, 0x3333, 0x4444];
@@ -993,7 +1057,7 @@ mod decode_tests {
     #[test]
     fn explicit_zero_sample_frame_returns_no_samples() {
         let mut dec = AlacDecoder::new(16, 2);
-        dec.set_info(&config_16(4));
+        dec.set_info(&config_16(4, 2));
 
         let mut w = BitWriter::new();
         w.put(1, 3); // channels = 1 (stereo)
@@ -1006,6 +1070,71 @@ mod decode_tests {
 
         let mut out = [0u8; 64];
         assert_eq!(dec.decode_frame(&w.bytes, &mut out), 0);
+    }
+
+    #[test]
+    fn unsupported_element_channel_type_returns_zero() {
+        let mut dec = AlacDecoder::new(16, 2);
+        dec.set_info(&config_16(4, 2));
+
+        let mut w = BitWriter::new();
+        w.put(2, 3); // unsupported ALAC element type for this decoder
+        w.put(0, 32);
+
+        let mut out = [0u8; 64];
+        assert_eq!(dec.decode_frame(&w.bytes, &mut out), 0);
+    }
+
+    #[test]
+    fn explicit_sample_count_larger_than_config_is_rejected() {
+        let mut dec = AlacDecoder::new(16, 2);
+        dec.set_info(&config_16(4, 2));
+
+        let mut w = BitWriter::new();
+        w.put(1, 3); // stereo
+        w.put(0, 4);
+        w.put(0, 12);
+        w.put(1, 1); // has_size = 1
+        w.put(0, 2); // uncompressed_bytes = 0
+        w.put(1, 1); // is_not_compressed = 1
+        w.put(5, 32); // output_samples > max_samples_per_frame
+
+        let mut out = [0u8; 64];
+        assert_eq!(dec.decode_frame(&w.bytes, &mut out), 0);
+    }
+
+    #[test]
+    fn set_info_uses_config_channel_count() {
+        // Constructor channel count can differ; ALACSpecificConfig must be authoritative.
+        let mut dec = AlacDecoder::new(16, 1);
+        dec.set_info(&config_16(2, 2));
+
+        let l: [u16; 2] = [0x0102, 0x7FFF];
+        let r: [u16; 2] = [0x1111, 0x2222];
+        let mut w = BitWriter::new();
+        w.put(1, 3); // stereo
+        w.put(0, 4);
+        w.put(0, 12);
+        w.put(0, 1);
+        w.put(0, 2);
+        w.put(1, 1);
+        for i in 0..2 {
+            w.put(l[i] as u32, 16);
+            w.put(r[i] as u32, 16);
+        }
+
+        let mut out = [0u8; 32];
+        let n = dec.decode_frame(&w.bytes, &mut out);
+        assert_eq!(n, 8);
+    }
+
+    #[test]
+    fn unsupported_bit_depth_config_disables_decode() {
+        let mut dec = AlacDecoder::new(16, 2);
+        dec.set_info(&config(20, 2, 4)); // out of AirPlay profile
+
+        let mut out = [0u8; 64];
+        assert_eq!(dec.decode_frame(&[0u8; 8], &mut out), 0);
     }
 
     // --- Golden vectors: real Apple-encoded (afconvert) *compressed* ALAC ---

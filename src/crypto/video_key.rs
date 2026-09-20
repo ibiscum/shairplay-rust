@@ -43,3 +43,26 @@ pub(crate) fn derive_stream_key_iv(
     ]);
     (key, iv)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derive_eaes_key_vector() {
+        let fairplay_key = *b"0123456789abcdef";
+        let ecdh_shared = *b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
+
+        let got = derive_eaes_key(&fairplay_key, &ecdh_shared);
+        assert_eq!(hex::encode(got), "eef98dc329d37f68929fb9564ed24ad3");
+    }
+
+    #[test]
+    fn derive_stream_key_iv_vector() {
+        let seed = *b"0123456789abcdef";
+        let (key, iv) = derive_stream_key_iv(&seed, 42);
+
+        assert_eq!(hex::encode(key), "732fb8cfca771985310cbfbf976e7487");
+        assert_eq!(hex::encode(iv), "28a0ca55a13f0c21252d8727227b9fc1");
+    }
+}

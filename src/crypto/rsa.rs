@@ -51,6 +51,13 @@ impl RsaKey {
         ip_addr: &[u8],
         hw_addr: &[u8],
     ) -> Result<String, CryptoError> {
+        if hw_addr.len() != 6 {
+            return Err(CryptoError::RsaKey("invalid hw_addr length".into()));
+        }
+        if ip_addr.len() != 4 && ip_addr.len() != 16 {
+            return Err(CryptoError::RsaKey("invalid ip_addr length".into()));
+        }
+
         let challenge = B64
             .decode(b64_challenge)
             .map_err(|_| CryptoError::RsaKey("invalid base64 challenge".into()))?;
@@ -106,8 +113,35 @@ impl RsaKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsa::RsaPublicKey;
 
     const AIRPORT_KEY: &str = include_str!("../../airport.key");
+
+    #[test]
+    fn sign_challenge_rejects_invalid_lengths() {
+        let key = RsaKey::from_pem(AIRPORT_KEY).expect("airport.key valid");
+        let challenge = B64.encode(b"abc");
+
+        assert!(key.sign_challenge(&challenge, &[127, 0, 0], &[0, 1, 2, 3, 4, 5]).is_err());
+        assert!(key.sign_challenge(&challenge, &[127, 0, 0, 1], &[0, 1, 2, 3, 4]).is_err());
+    }
+
+    #[test]
+    fn sign_challenge_accepts_ipv4_and_ipv6_lengths() {
+        let key = RsaKey::from_pem(AIRPORT_KEY).expect("airport.key valid");
+        let challenge = B64.encode(b"abcd");
+        let mac = [0, 1, 2, 3, 4, 5];
+
+        let sig4 = key
+            .sign_challenge(&challenge, &[127, 0, 0, 1], &mac)
+            .expect("valid IPv4 signing");
+        let sig6 = key
+            .sign_challenge(&challenge, &[0u8; 16], &mac)
+            .expect("valid IPv6 signing");
+
+        assert_eq!(B64.decode(sig4).expect("valid base64").len(), 256);
+        assert_eq!(B64.decode(sig6).expect("valid base64").len(), 256);
+    }
 
     #[test]
     fn decrypt_rejects_oversized_ciphertext() {
@@ -117,6 +151,34 @@ mod tests {
         // modulus-sized buffer.
         let oversized = "A".repeat(1024);
         assert!(key.decrypt(&oversized).is_err());
+    }
+
+    #[test]
+    fn decrypt_roundtrip_oaep_sha1() {
+        let key = RsaKey::from_pem(AIRPORT_KEY).expect("airport.key valid");
+        let public = RsaPublicKey::from(&key.key);
+        let plaintext = b"0123456789abcdef";
+        let ciphertext = public
+            .encrypt(&mut rand::thread_rng(), Oaep::new::<sha1::Sha1>(), plaintext)
+            .expect("encrypt with airport public key");
+        let b64 = B64.encode(ciphertext);
+
+        let decrypted = key.decrypt(&b64).expect("decrypt should succeed");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn decrypt_rejects_invalid_base64() {
+        let key = RsaKey::from_pem(AIRPORT_KEY).expect("airport.key valid");
+        assert!(key.decrypt("!!!").is_err());
+    }
+
+    #[test]
+    fn decrypt_rejects_valid_b64_invalid_ciphertext() {
+        let key = RsaKey::from_pem(AIRPORT_KEY).expect("airport.key valid");
+        // 16 zero bytes are valid base64-decoded data but not a valid OAEP block.
+        let invalid = B64.encode([0u8; 16]);
+        assert!(key.decrypt(&invalid).is_err());
     }
 
     // --- base64 engine parity (was src/util/base64.rs, C base64_encode/decode vectors) ---

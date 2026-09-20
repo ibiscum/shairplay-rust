@@ -72,6 +72,10 @@ pub enum CryptoError {
     /// AES encryption/decryption error.
     #[error("AES error: {0}")]
     Aes(String),
+
+    /// ChaCha20-Poly1305/HKDF transport encryption error.
+    #[error("transport crypto error: {0}")]
+    Transport(String),
 }
 
 /// Errors from networking (TCP/UDP sockets, mDNS registration).

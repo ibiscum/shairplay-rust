@@ -319,8 +319,12 @@ impl RaopBuffer {
         // Extract sequence number from RTP header bytes 2-3 (big-endian).
         let seqnum = if use_seqnum {
             ((data[2] as u16) << 8) | data[3] as u16
-        } else {
+        } else if self.is_empty {
             self.first_seqnum
+        } else {
+            // TCP/interleaved mode may deliver packets without reliable RTP
+            // sequence continuity; synthesize a monotonic local sequence.
+            self.last_seqnum.wrapping_add(1)
         };
 
         // Drop packets older than our current window.
@@ -482,5 +486,41 @@ impl RaopBuffer {
             self.first_seqnum = next_seq as u16;
             self.last_seqnum = (next_seq as u16).wrapping_sub(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pcm_packet(seq: u16, left: i16, right: i16) -> Vec<u8> {
+        let mut pkt = vec![0u8; 12];
+        pkt[0] = 0x80;
+        pkt[1] = 0x60;
+        pkt[2..4].copy_from_slice(&seq.to_be_bytes());
+        pkt.extend_from_slice(&left.to_be_bytes());
+        pkt.extend_from_slice(&right.to_be_bytes());
+        pkt
+    }
+
+    #[test]
+    fn queue_without_seqnum_accepts_back_to_back_packets() {
+        let mut buf = RaopBuffer::new_unencrypted("96 L16/44100/2", "").unwrap();
+
+        assert_eq!(buf.queue(&pcm_packet(10, 1000, -1000), false), 1);
+        assert_eq!(buf.queue(&pcm_packet(11, 2000, -2000), false), 1);
+
+        assert_eq!(buf.dequeue(true).unwrap().len(), 2);
+        assert_eq!(buf.dequeue(true).unwrap().len(), 2);
+        assert!(buf.dequeue(true).is_none());
+    }
+
+    #[test]
+    fn queue_without_seqnum_starts_from_flush_target() {
+        let mut buf = RaopBuffer::new_unencrypted("96 L16/44100/2", "").unwrap();
+        buf.flush(1234);
+        assert_eq!(buf.queue(&pcm_packet(0, 1, -1), false), 1);
+        assert_eq!(buf.first_seqnum, 1234);
+        assert_eq!(buf.last_seqnum, 1234);
     }
 }

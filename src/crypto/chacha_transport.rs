@@ -39,14 +39,20 @@ impl CipherContext {
     /// Encrypt plaintext into framed blocks. Returns the full wire bytes.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if plaintext.is_empty() {
-            return Err(CryptoError::Aes("empty plaintext".into()));
+            return Ok(Vec::new());
         }
 
         let cipher = ChaCha20Poly1305::new((&self.key).into());
         let nblocks = plaintext.len().div_ceil(MAX_BLOCK_LEN);
-        let mut out = Vec::with_capacity(nblocks * (2 + MAX_BLOCK_LEN + TAG_LEN));
+        let mut out = Vec::with_capacity(plaintext.len() + nblocks * (2 + TAG_LEN));
 
         for chunk in plaintext.chunks(MAX_BLOCK_LEN) {
+            if self.counter == u64::MAX {
+                return Err(CryptoError::Transport(
+                    "nonce counter exhausted before encryption".into(),
+                ));
+            }
+
             let block_len = (chunk.len() as u16).to_le_bytes();
             let nonce = self.nonce();
 
@@ -58,7 +64,7 @@ impl CipherContext {
                         aad: &block_len,
                     },
                 )
-                .map_err(|_| CryptoError::Aes("ChaCha20 encrypt failed".into()))?;
+                .map_err(|_| CryptoError::Transport("ChaCha20 encrypt failed".into()))?;
 
             // ct includes ciphertext + 16-byte tag appended by the AEAD
             out.extend_from_slice(&block_len);
@@ -82,6 +88,17 @@ impl CipherContext {
                 break; // Incomplete block
             }
 
+            if self.counter == u64::MAX {
+                return Err(CryptoError::Transport(
+                    "nonce counter exhausted before decryption".into(),
+                ));
+            }
+            if block_len == 0 {
+                return Err(CryptoError::Transport(
+                    "invalid framed block length: 0".into(),
+                ));
+            }
+
             let block_len_bytes = [ciphertext[pos], ciphertext[pos + 1]];
             let ct_with_tag = &ciphertext[pos + 2..pos + 2 + block_len + TAG_LEN];
             let nonce = self.nonce();
@@ -94,7 +111,7 @@ impl CipherContext {
                         aad: &block_len_bytes,
                     },
                 )
-                .map_err(|_| CryptoError::Aes("ChaCha20 decrypt failed".into()))?;
+                .map_err(|_| CryptoError::Transport("ChaCha20 decrypt failed".into()))?;
 
             plain.extend_from_slice(&pt);
             pos += frame_len;
@@ -126,11 +143,11 @@ impl EncryptedChannel {
 
         let hk = Hkdf::<Sha512>::new(Some(write_salt.as_bytes()), shared_secret);
         hk.expand(write_info.as_bytes(), &mut write_key)
-            .map_err(|_| CryptoError::Aes("HKDF write key failed".into()))?;
+            .map_err(|_| CryptoError::Transport("HKDF write key failed".into()))?;
 
         let hk = Hkdf::<Sha512>::new(Some(read_salt.as_bytes()), shared_secret);
         hk.expand(read_info.as_bytes(), &mut read_key)
-            .map_err(|_| CryptoError::Aes("HKDF read key failed".into()))?;
+            .map_err(|_| CryptoError::Transport("HKDF read key failed".into()))?;
 
         Ok(Self {
             encrypt_ctx: CipherContext::new(write_key),
@@ -235,6 +252,63 @@ mod tests {
         assert_ne!(server.encrypt_ctx.key, [0u8; 32]);
         assert_ne!(server.decrypt_ctx.key, [0u8; 32]);
         assert_ne!(server.encrypt_ctx.key, server.decrypt_ctx.key);
+    }
+
+    #[test]
+    fn encrypted_channel_events() {
+        let secret = [0x33u8; 64];
+        let server = EncryptedChannel::events(&secret).unwrap();
+        assert_ne!(server.encrypt_ctx.key, [0u8; 32]);
+        assert_ne!(server.decrypt_ctx.key, [0u8; 32]);
+        assert_ne!(server.encrypt_ctx.key, server.decrypt_ctx.key);
+    }
+
+    #[test]
+    fn encrypt_empty_plaintext_is_noop() {
+        let key = [0x42u8; 32];
+        let mut enc = CipherContext::new(key);
+        let ct = enc.encrypt(&[]).unwrap();
+        assert!(ct.is_empty());
+        assert_eq!(enc.counter, 0);
+    }
+
+    #[test]
+    fn decrypt_rejects_zero_length_frame() {
+        let key = [0x42u8; 32];
+        let mut dec = CipherContext::new(key);
+        // Complete frame for block_len=0: [len(2)] + [tag(16)].
+        let mut frame = vec![0u8; 2 + TAG_LEN];
+        frame[0] = 0;
+        frame[1] = 0;
+        assert!(matches!(
+            dec.decrypt(&frame),
+            Err(CryptoError::Transport(msg)) if msg.contains("block length: 0")
+        ));
+    }
+
+    #[test]
+    fn encrypt_rejects_counter_exhaustion() {
+        let key = [0x42u8; 32];
+        let mut enc = CipherContext::new(key);
+        enc.counter = u64::MAX;
+        assert!(matches!(
+            enc.encrypt(b"x"),
+            Err(CryptoError::Transport(msg)) if msg.contains("counter exhausted")
+        ));
+    }
+
+    #[test]
+    fn decrypt_rejects_counter_exhaustion() {
+        let key = [0x42u8; 32];
+        let mut enc = CipherContext::new(key);
+        let frame = enc.encrypt(b"x").unwrap();
+
+        let mut dec = CipherContext::new(key);
+        dec.counter = u64::MAX;
+        assert!(matches!(
+            dec.decrypt(&frame),
+            Err(CryptoError::Transport(msg)) if msg.contains("counter exhausted")
+        ));
     }
 
     // --- C-verified test vectors (generated from OpenSSL EVP_chacha20_poly1305) ---

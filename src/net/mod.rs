@@ -1,4 +1,8 @@
-//! Networking layer — TCP server, mDNS discovery, PTP timing, feature flags.
+//! Networking layer — TCP server and mDNS discovery.
+//!
+//! Feature-gated additions:
+//! - `ap2`: AirPlay 2 feature flags and PTP timing support.
+//! - `diagnostic-headers`: request/response header diagnostics.
 
 #[cfg(feature = "ap2")]
 pub mod features;

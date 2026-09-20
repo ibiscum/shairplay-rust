@@ -22,6 +22,10 @@
 | **Video (screen mirroring)** | **110** | **AES-128-CTR decrypt, H.264 decode, working on iOS 18** |
 | Unified output | — | Always F32LE interleaved PCM to app |
 
+Build note: AP2 crypto dependencies are constrained to digest-compatible major
+versions; `hkdf` is pinned to `0.12` to stay compatible with the crate's
+`sha2`/`hmac` stack and keep `--features ap2` buildable.
+
 ## MFi `/auth-setup` — Not Implemented
 
 The AP2 profile implements FairPlay (`/fp-setup`) and HomeKit pairing

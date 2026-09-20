@@ -1,4 +1,4 @@
-//! Protocol implementations (HTTP/RTSP, SDP, HTTP Digest auth).
+//! Protocol implementations (HTTP/RTSP, SDP, HTTP Digest auth, DMAP metadata).
 //!
 //! Binary plist parsing uses the `plist` crate directly at the call sites
 //! (see [`crate::raop`]); there is no in-crate plist wrapper.

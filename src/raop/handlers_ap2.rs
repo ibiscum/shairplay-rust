@@ -347,9 +347,24 @@ pub(crate) fn handle_setup(
     request: &HttpRequest,
     response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
-    let data = request.data()?;
-    let plist_val: plist::Value = plist::from_bytes(data).ok()?;
-    let dict = plist_val.as_dictionary()?;
+    let Some(data) = request.data() else {
+        tracing::warn!("AP2 SETUP missing request body");
+        response.set_disconnect(true);
+        return None;
+    };
+    let plist_val: plist::Value = match plist::from_bytes(data) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("AP2 SETUP invalid plist body: {e}");
+            response.set_disconnect(true);
+            return None;
+        }
+    };
+    let Some(dict) = plist_val.as_dictionary() else {
+        tracing::warn!("AP2 SETUP plist is not a dictionary");
+        response.set_disconnect(true);
+        return None;
+    };
     let keys: Vec<_> = dict.keys().collect();
     let has_streams = dict.get("streams").is_some();
     let is_mirror = dict
@@ -371,9 +386,23 @@ pub(crate) fn handle_setup(
     );
 
     let resp_dict = if let Some(streams) = dict.get("streams").and_then(|v| v.as_array()) {
-        setup_streams(conn, streams)?
+        match setup_streams(conn, streams) {
+            Some(dict) => dict,
+            None => {
+                tracing::warn!("AP2 stream SETUP rejected");
+                response.set_disconnect(true);
+                return None;
+            }
+        }
     } else {
-        setup_initial(conn, dict)?
+        match setup_initial(conn, dict) {
+            Some(dict) => dict,
+            None => {
+                tracing::warn!("AP2 initial SETUP rejected");
+                response.set_disconnect(true);
+                return None;
+            }
+        }
     };
 
     response.set_plist_body(&resp_dict)
@@ -839,10 +868,22 @@ fn setup_stream_video(
     stream0: &plist::Dictionary,
     stream_resp: &mut plist::Dictionary,
 ) -> Option<()> {
-    let stream_connection_id = stream0
+    let stream_connection_id = match stream0
         .get("streamConnectionID")
         .and_then(|v| v.as_signed_integer())
-        .unwrap_or(0) as u64;
+    {
+        Some(id) if id < 0 => {
+            tracing::warn!(stream_connection_id = id, "AP2 video streamConnectionID is negative");
+            conn.shared
+                .handler
+                .on_error(&ShairplayError::Crypto(CryptoError::FairPlay(
+                    "video stream key derivation: negative streamConnectionID".into(),
+                )));
+            return None;
+        }
+        Some(id) => id as u64,
+        None => 0,
+    };
     tracing::info!(
         stream_type = 110,
         stream_connection_id,

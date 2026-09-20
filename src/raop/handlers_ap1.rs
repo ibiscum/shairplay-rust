@@ -445,13 +445,20 @@ pub(crate) fn handle_set_parameter(
                     conn.shared.handler.on_volume(vol);
                 }
             } else if let Some(rest) = text.strip_prefix("progress: ") {
-                let parts: Vec<&str> = rest.trim().split('/').collect();
-                if parts.len() == 3 {
-                    conn.shared.handler.on_progress(
-                        parts[0].parse().unwrap_or(0),
-                        parts[1].parse().unwrap_or(0),
-                        parts[2].parse().unwrap_or(0),
-                    );
+                let mut parts = rest.trim().split('/');
+                if let (Some(start), Some(current), Some(end), None) = (
+                    parts.next(),
+                    parts.next(),
+                    parts.next(),
+                    parts.next(),
+                )
+                    && let (Ok(start), Ok(current), Ok(end)) = (
+                        start.parse::<u32>(),
+                        current.parse::<u32>(),
+                        end.parse::<u32>(),
+                    )
+                {
+                    conn.shared.handler.on_progress(start, current, end);
                 }
             }
         }
@@ -483,6 +490,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingHandler {
         errors: Mutex<Vec<String>>,
+        progress: Mutex<Vec<(u32, u32, u32)>>,
     }
 
     impl AudioHandler for RecordingHandler {
@@ -491,6 +499,10 @@ mod tests {
         }
         fn on_error(&self, error: &ShairplayError) {
             self.errors.lock().unwrap().push(error.to_string());
+        }
+
+        fn on_progress(&self, start: u32, current: u32, end: u32) {
+            self.progress.lock().unwrap().push((start, current, end));
         }
     }
 
@@ -582,5 +594,43 @@ mod tests {
             handler.errors.lock().unwrap().is_empty(),
             "no error expected on success"
         );
+    }
+
+    fn set_parameter_request(body: &str) -> HttpRequest {
+        let msg = format!(
+            "SET_PARAMETER rtsp://127.0.0.1/stream RTSP/1.0\r\nCSeq: 1\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .into_bytes();
+        let mut req = HttpRequest::new();
+        req.add_data(&msg).unwrap();
+        req
+    }
+
+    #[test]
+    fn set_parameter_progress_valid_notifies_handler() {
+        let handler = Arc::new(RecordingHandler::default());
+        let mut conn = test_connection(handler.clone());
+        let req = set_parameter_request("progress: 1/2/3\r\n");
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+
+        let out = handle_set_parameter(&mut conn, &req, &mut resp);
+
+        assert!(out.is_none());
+        assert_eq!(*handler.progress.lock().unwrap(), vec![(1, 2, 3)]);
+    }
+
+    #[test]
+    fn set_parameter_progress_malformed_is_ignored() {
+        let handler = Arc::new(RecordingHandler::default());
+        let mut conn = test_connection(handler.clone());
+        let req = set_parameter_request("progress: nope/2/3\r\n");
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+
+        let out = handle_set_parameter(&mut conn, &req, &mut resp);
+
+        assert!(out.is_none());
+        assert!(handler.progress.lock().unwrap().is_empty());
     }
 }

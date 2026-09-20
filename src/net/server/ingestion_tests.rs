@@ -280,6 +280,47 @@ async fn encrypted_buffer_limit_is_checked_before_copying() {
     assert_eq!(raw.len(), MAX_ENCRYPTED_BUFFER_LEN);
 }
 
+#[derive(Default)]
+struct EmptyDecryptHandler {
+    dispatches: AtomicUsize,
+}
+
+impl ConnectionHandler for EmptyDecryptHandler {
+    fn conn_request(&mut self, _request: &HttpRequest) -> HttpResponse {
+        self.dispatches.fetch_add(1, Ordering::SeqCst);
+        let mut response = HttpResponse::new("RTSP/1.0", 200, "OK");
+        response.finish(None);
+        response
+    }
+
+    fn decrypt_incoming(&mut self, data: &[u8]) -> Option<(Vec<u8>, usize)> {
+        // Consume encrypted bytes without producing plaintext so ingestion can
+        // exercise encrypted-buffer accounting independent of parser behavior.
+        Some((Vec::new(), data.len()))
+    }
+}
+
+#[tokio::test]
+async fn encrypted_buffer_limit_allows_exact_capacity() {
+    let mut handler = EmptyDecryptHandler::default();
+    let mut pending = PendingRequest::default();
+    let mut raw = vec![0; MAX_ENCRYPTED_BUFFER_LEN - 1];
+    let mut sink = tokio::io::sink();
+    let accepted = ingest_encrypted_data(
+        &mut sink,
+        &mut handler,
+        &mut pending,
+        &mut raw,
+        b"x",
+        ConnectionConfig::default(),
+    )
+    .await;
+    assert!(accepted);
+    // decrypt_incoming consumed the entire buffered frame.
+    assert_eq!(raw.len(), 0);
+    assert_eq!(handler.dispatches.load(Ordering::SeqCst), 0);
+}
+
 #[cfg(feature = "ap2")]
 fn encrypted_pair() -> (
     BoundedHandler,
@@ -365,4 +406,32 @@ async fn encrypted_partial_frame_cannot_extend_body_deadline() {
     assert!(read_closed(&mut client).await.is_empty());
     task.await.unwrap();
     assert_eq!(observed.dispatches.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "ap2")]
+#[tokio::test]
+async fn encrypted_auth_failure_is_rejected_without_dispatch() {
+    let (mut handler, mut peer) = encrypted_pair();
+    let mut pending = PendingRequest::default();
+    let mut raw = Vec::new();
+    let mut sink = tokio::io::sink();
+
+    let mut frame = peer.encrypt_ctx.encrypt(&headers("/bounded", 33)).unwrap();
+    // Corrupt ciphertext/tag to force decrypt failure.
+    let last = frame.len() - 1;
+    frame[last] ^= 0x01;
+
+    let accepted = ingest_encrypted_data(
+        &mut sink,
+        &mut handler,
+        &mut pending,
+        &mut raw,
+        &frame,
+        ConnectionConfig::default(),
+    )
+    .await;
+
+    assert!(!accepted);
+    assert_eq!(handler.observed.dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(handler.observed.policies.load(Ordering::SeqCst), 0);
 }

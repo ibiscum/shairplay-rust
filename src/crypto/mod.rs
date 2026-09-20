@@ -13,7 +13,9 @@ pub mod chacha_transport;
 pub mod pairing_homekit;
 #[cfg(feature = "ap2")]
 pub mod tlv;
-#[cfg(feature = "video")]
+// `video` implies `ap2` in Cargo features; keep both gates here so this
+// dependency remains explicit at the module boundary.
+#[cfg(all(feature = "ap2", feature = "video"))]
 pub mod video_cipher;
-#[cfg(feature = "video")]
+#[cfg(all(feature = "ap2", feature = "video"))]
 pub mod video_key;

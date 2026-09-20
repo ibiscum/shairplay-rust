@@ -62,6 +62,7 @@ struct PlayoutState {
     channels: u8,
     stopped: bool,
     format_changed: bool,
+    flush_pending: bool,
 }
 
 /// TCP listener for buffered audio. Binds a port and spawns the processing pipeline.
@@ -91,6 +92,7 @@ impl BufferedAudioProcessor {
                 channels: 2,
                 stopped: false,
                 format_changed: false,
+                flush_pending: false,
             }),
             Condvar::new(),
         ));
@@ -160,6 +162,10 @@ impl BufferedAudioProcessor {
                         for k in &keys {
                             s.buffer.remove(k);
                         }
+                        // Mirror AP1 behavior: propagate RTSP flush to the active
+                        // audio session even when no queued frame matches.
+                        s.flush_pending = true;
+                        cvar.notify_all();
                         debug!(flushed = keys.len(), "Flushed");
                     }
                     PlayoutCommand::Stop => {
@@ -276,9 +282,15 @@ async fn receive_loop(
             continue;
         };
 
-        // Decode
+        // Decode raw AAC payload by ADTS-framing it in the decoder.
         let pcm = if let Some(dec) = &mut decoder {
-            dec.decode(&plaintext)
+            match dec.decode(&plaintext) {
+                Ok(pcm) => Some(pcm),
+                Err(e) => {
+                    debug!(error = %e, ssrc = ?current_ssrc, "AAC decode failed");
+                    None
+                }
+            }
         } else {
             None
         };
@@ -327,7 +339,7 @@ fn delivery_loop(
     loop {
         let mut s = lock.lock().unwrap();
 
-        while !s.stopped && (s.rate == 0 || s.buffer.is_empty()) {
+        while !s.stopped && !s.flush_pending && (s.rate == 0 || s.buffer.is_empty()) {
             s = cvar.wait(s).unwrap();
         }
         if s.stopped {
@@ -347,6 +359,9 @@ fn delivery_loop(
             session = Some(handler.audio_init(format));
         }
 
+        let do_flush = s.flush_pending;
+        s.flush_pending = false;
+
         let now = now_ns();
         let elapsed_ns = now.saturating_sub(s.anchor_local_ns);
         let elapsed_frames = (elapsed_ns as u128 * s.sample_rate as u128 / 1_000_000_000) as u32;
@@ -365,6 +380,9 @@ fn delivery_loop(
         drop(s);
 
         if let Some(ref mut sess) = session {
+            if do_flush {
+                sess.audio_flush();
+            }
             for (_, frame) in &ready {
                 sess.audio_process(frame);
             }

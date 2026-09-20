@@ -1,4 +1,4 @@
-//! AES-128 encryption utilities (ECB, CTR) for AP1 audio decryption.
+//! AES-128-CTR utilities for AP1 audio stream decryption.
 
 use aes::Aes128;
 use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
@@ -62,5 +62,56 @@ impl AesCtr {
             }
             self.available -= n;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inc_counter_be(counter: &mut [u8; BLOCK_SIZE]) {
+        let mut carry: u16 = 1;
+        for i in (0..BLOCK_SIZE).rev() {
+            carry += counter[i] as u16;
+            counter[i] = carry as u8;
+            carry >>= 8;
+        }
+    }
+
+    #[test]
+    fn aes_ctr_empty_input_is_noop() {
+        let key = [0x11; 16];
+        let nonce = [0x22; 16];
+        let mut ctr = AesCtr::new(&key, &nonce);
+        let mut data = Vec::<u8>::new();
+        ctr.encrypt(&mut data);
+        assert!(data.is_empty());
+        assert_eq!(ctr.available, 0);
+    }
+
+    #[test]
+    fn aes_ctr_counter_carry_matches_manual_keystream() {
+        // Start at ..FF so the second block checks carry propagation into the
+        // next byte (..00 with carry into byte 14).
+        let key = [0x42; 16];
+        let mut counter = [0u8; 16];
+        counter[15] = 0xFF;
+
+        let mut ctr_data = [0u8; 32];
+        AesCtr::new(&key, &counter).encrypt(&mut ctr_data);
+
+        let cipher = Aes128::new((&key).into());
+        let mut expected = [0u8; 32];
+
+        let mut c0 = Array::from(counter);
+        cipher.encrypt_block(&mut c0);
+        expected[..16].copy_from_slice(&c0);
+
+        inc_counter_be(&mut counter);
+        let mut c1 = Array::from(counter);
+        cipher.encrypt_block(&mut c1);
+        expected[16..].copy_from_slice(&c1);
+
+        assert_eq!(ctr_data, expected);
     }
 }

@@ -105,6 +105,26 @@ fn policy_can_require_length_without_breaking_bodyless_requests() {
 }
 
 #[test]
+fn policy_failure_latches_and_blocks_followup_data() {
+    let mut request = HttpRequest::new();
+    let first = request.add_data_with_body_limit(b"OPTIONS * RTSP/1.0\r\n\r\n", |_| {
+        Err(ProtocolError::InvalidRtsp("policy denied".into()))
+    });
+    assert!(first.is_err());
+    assert!(!request.is_complete());
+    assert!(request.data().is_none());
+    assert!(request.take_leftover().is_empty());
+
+    // The parser must stay latched in failure state and reject new input.
+    let second = request.add_data_with_body_limit(b"OPTIONS * RTSP/1.0\r\n\r\n", |_| {
+        panic!("policy callback must not run after failure latch")
+    });
+    assert!(second.is_err());
+    assert!(!request.is_complete());
+    assert!(request.data().is_none());
+}
+
+#[test]
 fn preserves_pipelined_bytes_and_takes_them_once() {
     let next = b"OPTIONS * RTSP/1.0\r\n\r\n";
     let mut wire = b"POST /small RTSP/1.0\r\nContent-Length: 3\r\n\r\nabc".to_vec();
@@ -113,6 +133,22 @@ fn preserves_pipelined_bytes_and_takes_them_once() {
     request.add_data_with_body_limit(&wire, |_| Ok(3)).unwrap();
     assert_eq!(request.data(), Some(b"abc".as_slice()));
     assert_eq!(request.take_leftover(), next);
+    assert!(request.take_leftover().is_empty());
+}
+
+#[test]
+fn bytes_after_completion_are_retained_as_leftover() {
+    let mut request = HttpRequest::new();
+    request
+        .add_data_with_body_limit(b"POST /small RTSP/1.0\r\nContent-Length: 1\r\n\r\na", |_| {
+            Ok(1)
+        })
+        .unwrap();
+    assert!(request.is_complete());
+    assert_eq!(request.data(), Some(b"a".as_slice()));
+
+    request.add_data(b"OPTIONS * RTSP/1.0\r\n\r\n").unwrap();
+    assert_eq!(request.take_leftover(), b"OPTIONS * RTSP/1.0\r\n\r\n");
     assert!(request.take_leftover().is_empty());
 }
 

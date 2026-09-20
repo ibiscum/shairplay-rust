@@ -99,22 +99,52 @@ impl AudioSsrc {
 /// Construct a 7-byte ADTS header for a raw AAC packet.
 ///
 /// `packet_len` is the total length including the 7-byte header itself.
-/// `rate` is the sample rate (44100 or 48000).
-/// `channels` is the channel configuration (2 = stereo).
-// ADTS framing helpers retained for the AAC path and verified by the unit
-// tests; not currently invoked by the buffered-audio production code.
+/// `rate` is the AAC sample rate.
+/// `channels` is the ADTS channel configuration index (not raw channel count).
 #[allow(dead_code)]
-pub(crate) fn adts_header(packet_len: usize, rate: u32, channels: u8) -> [u8; 7] {
+pub(crate) fn adts_header(packet_len: usize, rate: u32, channels: u8) -> Result<[u8; 7], String> {
+    if packet_len < 7 {
+        return Err("ADTS frame length must include 7-byte header".to_string());
+    }
+    if packet_len > 0x1FFF {
+        return Err(format!(
+            "ADTS frame length exceeds 13-bit limit: {} > 8191",
+            packet_len
+        ));
+    }
+    if channels > 7 {
+        return Err(format!(
+            "ADTS channel configuration out of range: {}",
+            channels
+        ));
+    }
+
     let profile = 2u8; // AAC-LC
     let freq_idx: u8 = match rate {
+        96000 => 0,
+        88200 => 1,
+        64000 => 2,
         48000 => 3,
         44100 => 4,
-        _ => 4, // default to 44100
+        32000 => 5,
+        24000 => 6,
+        22050 => 7,
+        16000 => 8,
+        12000 => 9,
+        11025 => 10,
+        8000 => 11,
+        7350 => 12,
+        _ => {
+            return Err(format!(
+                "Unsupported ADTS sample rate: {} Hz",
+                rate
+            ))
+        }
     };
     let chan_cfg = channels;
 
     let len = packet_len as u16;
-    [
+    Ok([
         0xFF,
         0xF9,
         ((profile - 1) << 6) | (freq_idx << 2) | (chan_cfg >> 2),
@@ -122,23 +152,25 @@ pub(crate) fn adts_header(packet_len: usize, rate: u32, channels: u8) -> [u8; 7]
         ((len & 0x7FF) >> 3) as u8,
         (((len & 7) as u8) << 5) | 0x1F,
         0xFC,
-    ]
+    ])
 }
 
 /// Wrap a raw AAC frame with an ADTS header.
 #[allow(dead_code)]
-pub(crate) fn wrap_adts(raw_aac: &[u8], rate: u32, channels: u8) -> Vec<u8> {
+pub(crate) fn wrap_adts(raw_aac: &[u8], rate: u32, channels: u8) -> Result<Vec<u8>, String> {
     let total_len = raw_aac.len() + 7;
-    let header = adts_header(total_len, rate, channels);
+    let header = adts_header(total_len, rate, channels)?;
     let mut out = Vec::with_capacity(total_len);
     out.extend_from_slice(&header);
     out.extend_from_slice(raw_aac);
-    out
+    Ok(out)
 }
 
-/// Persistent AAC decoder using symphonia. Decodes ADTS-wrapped AAC to F32LE PCM.
+/// Persistent AAC decoder using symphonia. Decodes raw AAC by first ADTS-framing it.
 pub(crate) struct AacDecoder {
     decoder: Box<dyn symphonia::core::codecs::audio::AudioDecoder>,
+    sample_rate: u32,
+    adts_channel_config: u8,
 }
 
 impl AacDecoder {
@@ -177,23 +209,42 @@ impl AacDecoder {
         };
         params.with_channels(ch);
 
+        let adts_channel_config = match channels {
+            1..=7 => channels,
+            8 => 7, // ADTS channel config 7 corresponds to 7.1.
+            _ => {
+                return Err(format!(
+                    "Unsupported AAC channel count for ADTS framing: {}",
+                    channels
+                ))
+            }
+        };
+
         let decoder = symphonia::default::get_codecs()
             .make_audio_decoder(&params, &AudioDecoderOptions::default())
             .map_err(|e| format!("AAC decoder init failed: {e}"))?;
 
-        Ok(Self { decoder })
+        Ok(Self {
+            decoder,
+            sample_rate,
+            adts_channel_config,
+        })
     }
 
     /// Decode a raw AAC frame (without ADTS header) to interleaved F32 PCM.
-    pub(crate) fn decode(&mut self, raw_aac: &[u8]) -> Option<Vec<u8>> {
+    pub(crate) fn decode(&mut self, raw_aac: &[u8]) -> Result<Vec<u8>, String> {
         use symphonia::core::packet::PacketRef;
         use symphonia::core::units::{Duration, Timestamp};
 
-        let packet = PacketRef::new(0, Timestamp::new(0), Duration::new(1024), raw_aac);
-        let decoded = self.decoder.decode_ref(&packet).ok()?;
+        let framed = wrap_adts(raw_aac, self.sample_rate, self.adts_channel_config)?;
+        let packet = PacketRef::new(0, Timestamp::new(0), Duration::new(1024), &framed);
+        let decoded = self
+            .decoder
+            .decode_ref(&packet)
+            .map_err(|e| format!("AAC decode failed: {e}"))?;
         let mut pcm = Vec::new();
         decoded.copy_bytes_to_vec_interleaved_as::<f32>(&mut pcm);
-        Some(pcm)
+        Ok(pcm)
     }
 }
 
@@ -209,26 +260,26 @@ mod tests {
 
     #[test]
     fn c_vector_adts_44100_stereo_107() {
-        let h = adts_header(107, 44100, 2);
+        let h = adts_header(107, 44100, 2).expect("valid adts header");
         assert_eq!(hex_encode(&h), "fff950800d7ffc");
     }
 
     #[test]
     fn c_vector_adts_48000_stereo_507() {
-        let h = adts_header(507, 48000, 2);
+        let h = adts_header(507, 48000, 2).expect("valid adts header");
         assert_eq!(hex_encode(&h), "fff94c803f7ffc");
     }
 
     #[test]
     fn c_vector_adts_44100_stereo_1031() {
-        let h = adts_header(1031, 44100, 2);
+        let h = adts_header(1031, 44100, 2).expect("valid adts header");
         assert_eq!(hex_encode(&h), "fff9508080fffc");
     }
 
     #[test]
     fn wrap_adts_prepends_header() {
         let raw = vec![0xDE, 0xAD];
-        let wrapped = wrap_adts(&raw, 44100, 2);
+        let wrapped = wrap_adts(&raw, 44100, 2).expect("valid adts wrap");
         assert_eq!(wrapped.len(), 9); // 7 header + 2 payload
         assert_eq!(&wrapped[0..2], &[0xFF, 0xF9]); // sync word
         assert_eq!(&wrapped[7..], &[0xDE, 0xAD]); // payload preserved
@@ -237,11 +288,29 @@ mod tests {
     #[test]
     fn adts_wrap_produces_valid_sync() {
         let raw_aac = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let adts = wrap_adts(&raw_aac, 44100, 2);
+        let adts = wrap_adts(&raw_aac, 44100, 2).expect("valid adts wrap");
         assert_eq!(adts[0], 0xFF); // sync byte 1
         assert_eq!(adts[1] & 0xF0, 0xF0); // sync byte 2
         assert_eq!(&adts[7..], &raw_aac[..]); // payload preserved
         assert_eq!(adts.len(), 7 + 4); // header + payload
+    }
+
+    #[test]
+    fn adts_rejects_invalid_sample_rate() {
+        let err = adts_header(100, 12345, 2).expect_err("invalid sample rate should fail");
+        assert!(err.contains("Unsupported ADTS sample rate"));
+    }
+
+    #[test]
+    fn adts_rejects_invalid_channel_config() {
+        let err = adts_header(100, 44100, 8).expect_err("invalid channel config should fail");
+        assert!(err.contains("channel configuration out of range"));
+    }
+
+    #[test]
+    fn adts_rejects_oversized_frame() {
+        let err = adts_header(8192, 44100, 2).expect_err("oversized frame should fail");
+        assert!(err.contains("exceeds 13-bit limit"));
     }
 }
 
@@ -329,27 +398,27 @@ mod adts_multi_tests {
 
     #[test]
     fn adts_44100_stereo() {
-        let h = adts_header(100, 44100, 2);
+        let h = adts_header(100, 44100, 2).expect("valid adts header");
         assert_eq!(h[0], 0xFF);
         assert_eq!((h[2] >> 2) & 0x0F, 4); // freq_idx=4 (44100)
     }
 
     #[test]
     fn adts_48000_stereo() {
-        let h = adts_header(100, 48000, 2);
+        let h = adts_header(100, 48000, 2).expect("valid adts header");
         assert_eq!((h[2] >> 2) & 0x0F, 3); // freq_idx=3 (48000)
     }
 
     #[test]
     fn adts_48000_surround51() {
-        let h = adts_header(200, 48000, 6);
+        let h = adts_header(200, 48000, 6).expect("valid adts header");
         let chan = ((h[2] & 1) << 2) | ((h[3] >> 6) & 3);
         assert_eq!(chan, 6);
     }
 
     #[test]
     fn adts_48000_surround71() {
-        let h = adts_header(200, 48000, 7); // 7 = ADTS config for 7.1
+        let h = adts_header(200, 48000, 7).expect("valid adts header"); // 7 = ADTS config for 7.1
         let chan = ((h[2] & 1) << 2) | ((h[3] >> 6) & 3);
         assert_eq!(chan, 7);
     }

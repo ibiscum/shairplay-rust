@@ -58,18 +58,76 @@ pub(crate) struct RaopShared {
 }
 
 #[cfg(feature = "ap2")]
+fn swap_active_audio_slot(
+    slot: &std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    stop: Box<dyn FnOnce() + Send>,
+) {
+    let prev = match slot.lock() {
+        Ok(mut guard) => guard.replace(stop),
+        Err(poisoned) => {
+            tracing::warn!("active_audio mutex poisoned; recovering");
+            let mut guard = poisoned.into_inner();
+            guard.replace(stop)
+        }
+    };
+    if let Some(prev) = prev {
+        prev();
+    }
+}
+
+#[cfg(feature = "ap2")]
 impl RaopShared {
     /// Register a newly-started audio session, stopping the previous one so only
     /// the latest connection's playout feeds the audio output.
     pub(crate) fn set_active_audio(&self, stop: Box<dyn FnOnce() + Send>) {
-        let prev = self
-            .active_audio
-            .lock()
-            .ok()
-            .and_then(|mut g| g.replace(stop));
-        if let Some(prev) = prev {
-            prev();
-        }
+        swap_active_audio_slot(&self.active_audio, stop);
+    }
+}
+
+#[cfg(all(test, feature = "ap2"))]
+mod tests {
+    use super::swap_active_audio_slot;
+    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn swap_active_audio_runs_previous_handle() {
+        let slot = Mutex::new(None);
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_a = count.clone();
+        swap_active_audio_slot(&slot, Box::new(move || {
+            count_a.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+
+        let count_b = count.clone();
+        swap_active_audio_slot(&slot, Box::new(move || {
+            count_b.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn swap_active_audio_recovers_from_poison() {
+        let slot = Mutex::new(None);
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = slot.lock().unwrap();
+            panic!("poison");
+        }));
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_a = count.clone();
+        swap_active_audio_slot(&slot, Box::new(move || {
+            count_a.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let count_b = count.clone();
+        swap_active_audio_slot(&slot, Box::new(move || {
+            count_b.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }
 

@@ -20,6 +20,10 @@ A complete AirPlay audio and video receiver as a Rust library. Supports both cla
 
 > ⚠️ **Pre-1.0 notice:** This crate is under active development. Minor version bumps (e.g. 0.1 → 0.2) may include breaking API changes. Pin your dependency to a specific minor version (`shairplay = "0.2"`) and review the [CHANGELOG](CHANGELOG.md) before upgrading.
 
+## Documentation
+
+- [Workspace Purpose and Flow](docs/workspace-purpose-and-flow.md) — repository purpose, module map, runtime flow, and contributor workflow.
+
 ## Installation
 
 Add the current release from crates.io:
@@ -170,6 +174,11 @@ limits and requirements for conformant receiver authentication.
 | `ap2` | chacha20poly1305, hkdf, symphonia, … (implies `resample`) | Full AirPlay 2 audio |
 | `video` | (implies `ap2`) | Legacy feature set for screen mirroring (`0x527FFEE6`) |
 | `hls` | (implies `video`) | HLS video playback (YouTube, etc.) — receiver relays URL to app |
+
+AP2 crypto dependencies must stay on digest-compatible major lines. In
+particular, `hkdf` is intentionally pinned to the `0.12` line so it remains
+compatible with the crate's `sha2`/`hmac` stack used by pairing and RTSP
+transport key derivation.
 
 ### Experimental PipeWire Probe Compatibility
 

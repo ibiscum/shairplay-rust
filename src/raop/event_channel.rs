@@ -11,6 +11,9 @@ use tracing::{debug, warn};
 use crate::crypto::chacha_transport::EncryptedChannel;
 use crate::error::NetworkError;
 
+/// Upper bound for buffered encrypted event-channel bytes.
+const MAX_ENCRYPTED_EVENT_BUFFER_LEN: usize = 1024 * 1024;
+
 /// Handle for sending commands through the event channel.
 #[derive(Clone)]
 pub(crate) struct EventSender {
@@ -69,6 +72,13 @@ impl EventChannel {
                         Ok(0) => { debug!("Event channel closed by client"); break; }
                         Ok(n) => {
                             encrypted_buf.extend_from_slice(&buf[..n]);
+                            if encrypted_buf.len() > MAX_ENCRYPTED_EVENT_BUFFER_LEN {
+                                warn!(
+                                    len = encrypted_buf.len(),
+                                    "Event channel encrypted buffer exceeded limit"
+                                );
+                                break;
+                            }
                             debug!(n, "Event channel data received");
                             match channel.decrypt_ctx.decrypt(&encrypted_buf) {
                                 Ok((plain, consumed)) => {
@@ -77,7 +87,10 @@ impl EventChannel {
                                         debug!(len = plain.len(), "Event channel message received");
                                     }
                                 }
-                                Err(e) => { warn!("Event channel decrypt error: {e}"); }
+                                Err(e) => {
+                                    warn!("Event channel decrypt error: {e}");
+                                    break;
+                                }
                             }
                         }
                         Err(e) => { warn!("Event channel read error: {e}"); break; }

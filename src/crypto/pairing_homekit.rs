@@ -208,7 +208,7 @@ impl SrpServer {
             // Return auth error TLV
             let mut tlv = TlvValues::new();
             tlv.add(TlvType::State as u8, &[4]);
-            tlv.add(TlvType::Error as u8, &[2]); // TLVError_Authentication
+            tlv.add(TlvType::Error as u8, &[TLV_ERROR_AUTHENTICATION]);
             return Ok(tlv.encode());
         }
 
@@ -333,9 +333,10 @@ fn encrypt_chacha(
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
     let cipher = ChaCha20Poly1305::new(key.into());
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::try_from(&nonce_bytes[..])
+        .map_err(|_| CryptoError::PairingHandshake("invalid nonce length".into()))?;
     cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|_| CryptoError::PairingHandshake("ChaCha20 encrypt failed".into()))
 }
 
@@ -345,9 +346,10 @@ fn decrypt_chacha(
     ciphertext_with_tag: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
     let cipher = ChaCha20Poly1305::new(key.into());
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::try_from(&nonce_bytes[..])
+        .map_err(|_| CryptoError::PairingHandshake("invalid nonce length".into()))?;
     cipher
-        .decrypt(nonce, ciphertext_with_tag)
+        .decrypt(&nonce, ciphertext_with_tag)
         .map_err(|_| CryptoError::PairingHandshake("ChaCha20 decrypt failed".into()))
 }
 
@@ -581,6 +583,7 @@ pub(crate) struct PairVerifyServer {
     server_eph_pk: [u8; 32],
     client_eph_pk: [u8; 32],
     shared_secret: [u8; 32],
+    m1_processed: bool,
     completed: bool,
 }
 
@@ -605,6 +608,7 @@ impl PairVerifyServer {
             server_eph_pk: *eph_pk.as_bytes(),
             client_eph_pk: [0u8; 32],
             shared_secret: [0u8; 32],
+            m1_processed: false,
             completed: false,
         }
     }
@@ -613,6 +617,14 @@ impl PairVerifyServer {
     pub(crate) fn process_m1_build_m2(&mut self, data: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let tlv =
             TlvValues::decode(data).map_err(|e| CryptoError::PairingHandshake(e.to_string()))?;
+        let state = tlv
+            .get_type(TlvType::State)
+            .ok_or_else(|| CryptoError::PairingHandshake("Verify M1: missing state".into()))?;
+        if state != [1] {
+            return Err(CryptoError::PairingHandshake(
+                "Verify M1: unexpected state".into(),
+            ));
+        }
         let client_pk = tlv
             .get_type(TlvType::PublicKey)
             .ok_or_else(|| CryptoError::PairingHandshake("Verify M1: missing public key".into()))?;
@@ -627,6 +639,7 @@ impl PairVerifyServer {
         let secret = x25519_dalek::StaticSecret::from(self.server_eph_sk);
         let client_pub = x25519_dalek::PublicKey::from(self.client_eph_pk);
         self.shared_secret = *secret.diffie_hellman(&client_pub).as_bytes();
+        self.m1_processed = true;
 
         // Sign: server_eph_pk || device_id || client_eph_pk
         let mut info = Vec::new();
@@ -669,8 +682,21 @@ impl PairVerifyServer {
         data: &[u8],
         lookup: PairingKeyLookup<'_>,
     ) -> Result<Vec<u8>, CryptoError> {
+        if !self.m1_processed {
+            return Err(CryptoError::PairingHandshake(
+                "Verify M3: M1 must be processed first".into(),
+            ));
+        }
         let tlv =
             TlvValues::decode(data).map_err(|e| CryptoError::PairingHandshake(e.to_string()))?;
+        let state = tlv
+            .get_type(TlvType::State)
+            .ok_or_else(|| CryptoError::PairingHandshake("Verify M3: missing state".into()))?;
+        if state != [3] {
+            return Err(CryptoError::PairingHandshake(
+                "Verify M3: unexpected state".into(),
+            ));
+        }
         let enc = tlv.get_type(TlvType::EncryptedData).ok_or_else(|| {
             CryptoError::PairingHandshake("Verify M3: missing encrypted data".into())
         })?;
@@ -922,7 +948,7 @@ mod tests {
         assert!(server.shared_secret().is_none()); // not transient → no secret yet
 
         // --- M5: Client sends encrypted device info ---
-        let client_sk = SigningKey::generate(&mut rand::thread_rng());
+        let client_sk = SigningKey::from_bytes(&rand::random::<[u8; 32]>());
         let client_vk = client_sk.verifying_key();
         let client_device_id = "MockClient01";
 

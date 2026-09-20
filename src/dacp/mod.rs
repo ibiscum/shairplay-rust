@@ -29,7 +29,7 @@ fn shuffle_path(on: bool) -> String {
 }
 
 fn repeat_path(state: u8) -> String {
-    format!("/ctrl-int/1/setproperty?dacp.repeatstate={state}")
+    format!("/ctrl-int/1/setproperty?dacp.repeatstate={}", state.min(2))
 }
 
 /// Browse `_dacp._tcp` via mDNS and return the port for the given DACP-ID.
@@ -42,7 +42,8 @@ fn discover_dacp_port(dacp_id: &str, _remote_ip: std::net::IpAddr) -> Option<u16
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
 
     while std::time::Instant::now() < deadline {
-        match receiver.recv_timeout(deadline.duration_since(std::time::Instant::now())) {
+        let timeout = deadline.saturating_duration_since(std::time::Instant::now());
+        match receiver.recv_timeout(timeout) {
             Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
                 if info.get_fullname().to_uppercase().contains(&target) {
                     let port = info.get_port();
@@ -118,7 +119,9 @@ impl DacpClient {
     /// Send a raw DACP command from synchronous callbacks.
     pub(crate) fn command_blocking(&self, path: &str) -> Result<(), NetworkError> {
         let addr = self.addr.ok_or_else(|| {
-            NetworkError::Mdns("DACP not discovered yet — call discover() first".into())
+            NetworkError::Mdns(
+                "DACP not discovered yet — call discover_from_remote() first".into(),
+            )
         })?;
 
         let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
@@ -128,7 +131,14 @@ impl DacpClient {
         stream.write_all(request.as_bytes())?;
 
         let mut buf = [0u8; 1024];
-        let _ = stream.read(&mut buf);
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(NetworkError::Mdns("DACP command returned empty response".into()));
+        }
+        let status = std::str::from_utf8(&buf[..n]).unwrap_or_default();
+        if !(status.starts_with("HTTP/1.1 2") || status.starts_with("HTTP/1.0 2")) {
+            return Err(NetworkError::Mdns("DACP command failed".into()));
+        }
         Ok(())
     }
 
@@ -162,8 +172,46 @@ impl DacpClient {
 
     fn command_request(&self, path: &str, addr: SocketAddr) -> String {
         format!(
-            "GET {path} HTTP/1.1\r\nActive-Remote: {}\r\nHost: {addr}\r\n\r\n",
+            "GET {path} HTTP/1.1\r\nActive-Remote: {}\r\nHost: {addr}\r\nConnection: close\r\n\r\n",
             self.active_remote
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn volume_and_repeat_paths_clamp() {
+        assert_eq!(volume_path(55), "/ctrl-int/1/setproperty?dmcp.volume=55");
+        assert_eq!(volume_path(200), "/ctrl-int/1/setproperty?dmcp.volume=100");
+
+        assert_eq!(repeat_path(0), "/ctrl-int/1/setproperty?dacp.repeatstate=0");
+        assert_eq!(repeat_path(2), "/ctrl-int/1/setproperty?dacp.repeatstate=2");
+        assert_eq!(repeat_path(9), "/ctrl-int/1/setproperty?dacp.repeatstate=2");
+    }
+
+    #[test]
+    fn command_request_contains_required_headers() {
+        let client = DacpClient::new("DACP", "1234");
+        let req = client.command_request(
+            PLAY_PAUSE_PATH,
+            "127.0.0.1:3689".parse().expect("valid socket addr"),
+        );
+        assert!(req.starts_with("GET /ctrl-int/1/playpause HTTP/1.1\r\n"));
+        assert!(req.contains("Active-Remote: 1234\r\n"));
+        assert!(req.contains("Host: 127.0.0.1:3689\r\n"));
+        assert!(req.contains("Connection: close\r\n"));
+        assert!(req.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn command_requires_discovery_first() {
+        let client = DacpClient::new("DACP", "1234");
+        let err = client
+            .command_blocking(PLAY_PAUSE_PATH)
+            .expect_err("command should fail without discovery");
+        assert!(err.to_string().contains("discover_from_remote()"));
     }
 }

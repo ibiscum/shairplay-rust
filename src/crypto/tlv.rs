@@ -68,6 +68,24 @@ impl TlvValues {
             .map(|(_, v)| v.as_slice())
     }
 
+    /// Get the last TLV value by raw tag number.
+    pub fn get_last(&self, tag: u8) -> Option<&[u8]> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|(t, _)| *t == tag)
+            .map(|(_, v)| v.as_slice())
+    }
+
+    /// Get all TLV values by raw tag number, in insertion order.
+    pub fn get_all(&self, tag: u8) -> Vec<&[u8]> {
+        self.entries
+            .iter()
+            .filter(|(t, _)| *t == tag)
+            .map(|(_, v)| v.as_slice())
+            .collect()
+    }
+
     /// Get a TLV value by typed tag.
     pub fn get_type(&self, tag: TlvType) -> Option<&[u8]> {
         self.get(tag as u8)
@@ -174,6 +192,53 @@ mod tests {
     fn truncated_input() {
         assert!(TlvValues::decode(&[6]).is_err());
         assert!(TlvValues::decode(&[6, 5, 1, 2]).is_err());
+    }
+
+    #[test]
+    fn duplicate_tag_getters() {
+        let mut tlv = TlvValues::new();
+        tlv.add(6, &[1]);
+        tlv.add(6, &[2]);
+        tlv.add(3, &[9]);
+
+        // Existing behavior remains first-match.
+        assert_eq!(tlv.get(6), Some(&[1u8][..]));
+        // New helpers expose last and all values for duplicate tags.
+        assert_eq!(tlv.get_last(6), Some(&[2u8][..]));
+        assert_eq!(tlv.get_all(6), vec![&[1u8][..], &[2u8][..]]);
+        assert_eq!(tlv.get_all(0x7f), Vec::<&[u8]>::new());
+    }
+
+    #[test]
+    fn decode_same_tag_255_boundary_merges_adjacent_chunks() {
+        // Explicitly pin current decode semantics: if a tag's previous value
+        // length is exactly 255 bytes, an adjacent same-tag field is
+        // concatenated as a continuation chunk.
+        let mut encoded = Vec::new();
+        encoded.push(3);
+        encoded.push(255);
+        encoded.extend_from_slice(&vec![0xAA; 255]);
+        encoded.push(3);
+        encoded.push(1);
+        encoded.push(0xBB);
+
+        let decoded = TlvValues::decode(&encoded).unwrap();
+        let vals = decoded.get_all(3);
+        assert_eq!(vals.len(), 1);
+        assert_eq!(vals[0].len(), 256);
+        assert_eq!(vals[0][0], 0xAA);
+        assert_eq!(vals[0][255], 0xBB);
+    }
+
+    #[test]
+    fn decode_same_tag_without_255_boundary_keeps_separate_entries() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&[3, 2, 0x11, 0x22]);
+        encoded.extend_from_slice(&[3, 1, 0x33]);
+
+        let decoded = TlvValues::decode(&encoded).unwrap();
+        let vals = decoded.get_all(3);
+        assert_eq!(vals, vec![&[0x11, 0x22][..], &[0x33][..]]);
     }
 
     // --- C-verified test vectors (generated from pair-tlv.c) ---

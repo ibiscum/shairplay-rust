@@ -28,22 +28,31 @@ impl VideoCipher {
 
     /// Decrypt a video payload in-place, maintaining streaming CTR state.
     pub(crate) fn decrypt(&mut self, payload: &mut [u8]) {
+        debug_assert!(self.leftover_count <= 15);
+
+        let mut offset = 0usize;
         let n = self.leftover_count;
 
         // Apply leftover keystream from previous partial block
         if n > 0 {
             let apply = n.min(payload.len());
-            for (p, &k) in payload[..apply].iter_mut().zip(&self.leftover[(16 - n)..]) {
+            let start = 16 - n;
+            for (p, &k) in payload[..apply]
+                .iter_mut()
+                .zip(&self.leftover[start..start + apply])
+            {
                 *p ^= k;
             }
             if apply < n {
                 self.leftover_count = n - apply;
+                debug_assert!(self.leftover_count <= 15);
                 return;
             }
+            self.leftover_count = 0;
+            offset = apply;
         }
 
         // Decrypt full blocks
-        let offset = n;
         let remaining = payload.len() - offset;
         let full_len = (remaining / 16) * 16;
         self.cipher
@@ -58,6 +67,7 @@ impl VideoCipher {
             self.cipher.apply_keystream(&mut self.leftover);
             payload[rest_start..].copy_from_slice(&self.leftover[..rest_len]);
             self.leftover_count = 16 - rest_len;
+            debug_assert!(self.leftover_count <= 15);
         } else {
             self.leftover_count = 0;
         }
@@ -104,5 +114,50 @@ mod tests {
         // Results must match
         assert_eq!(&chunk1[..], &full[..10]);
         assert_eq!(&chunk2[..], &full[10..]);
+    }
+
+    #[test]
+    fn decrypt_tiny_chunks_matches_single_pass() {
+        let key = [0x21u8; 16];
+        let iv = [0x10u8; 16];
+
+        // Build deterministic input and process it in many tiny chunks to hit
+        // repeated "apply < leftover" paths.
+        let original: Vec<u8> = (0u8..40).collect();
+        let mut chunked = original.clone();
+
+        let mut cipher_a = VideoCipher::new(&key, &iv);
+        let mut pos = 0usize;
+        for &size in &[1usize, 1, 1, 5, 2, 8, 3, 4, 15] {
+            let end = (pos + size).min(chunked.len());
+            cipher_a.decrypt(&mut chunked[pos..end]);
+            pos = end;
+            if pos == chunked.len() {
+                break;
+            }
+        }
+
+        let mut single = original.clone();
+        let mut cipher_b = VideoCipher::new(&key, &iv);
+        cipher_b.decrypt(&mut single);
+
+        assert_eq!(chunked, single);
+    }
+
+    #[test]
+    fn decrypt_empty_payload_keeps_state() {
+        let key = [0xABu8; 16];
+        let iv = [0xCDu8; 16];
+        let mut cipher = VideoCipher::new(&key, &iv);
+
+        // Seed leftover state with a partial block.
+        let mut one = [0u8; 1];
+        cipher.decrypt(&mut one);
+        let before = cipher.leftover_count;
+
+        let mut empty: [u8; 0] = [];
+        cipher.decrypt(&mut empty);
+
+        assert_eq!(cipher.leftover_count, before);
     }
 }

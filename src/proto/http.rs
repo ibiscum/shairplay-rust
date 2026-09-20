@@ -76,6 +76,8 @@ impl HttpRequest {
         on_headers: impl FnOnce(&Self) -> Result<usize, ProtocolError>,
     ) -> Result<(), ProtocolError> {
         if self.complete {
+            // Once complete, any additional bytes belong to the next pipelined request.
+            self.buffer.extend_from_slice(data);
             return Ok(());
         }
         if !self.headers_complete {

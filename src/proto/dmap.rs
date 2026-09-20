@@ -26,32 +26,76 @@ impl TrackMetadata {
     /// Parse DMAP binary data into structured metadata.
     pub(crate) fn from_dmap(data: &[u8]) -> Self {
         let mut meta = Self::default();
-        let mut pos = 8; // skip mlit header
-        while pos + 8 <= data.len() {
-            let tag = &data[pos..pos + 4];
-            let len =
-                u32::from_be_bytes(data[pos + 4..pos + 8].try_into().unwrap_or([0; 4])) as usize;
-            pos += 8;
-            if pos + len > data.len() {
+        if data.len() < 8 || &data[..4] != b"mlit" {
+            return meta;
+        }
+
+        let declared_len = u32::from_be_bytes(data[4..8].try_into().unwrap()) as usize;
+        let Some(declared_end) = 8usize.checked_add(declared_len) else {
+            return meta;
+        };
+        // Parse only the declared mlit payload, but tolerate truncated frames.
+        let end = declared_end.min(data.len());
+
+        let mut pos: usize = 8;
+        while let Some(header_end) = pos.checked_add(8) {
+            if header_end > end {
                 break;
             }
-            let chunk = &data[pos..pos + len];
+            let tag = &data[pos..pos + 4];
+            let len = u32::from_be_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            pos += 8;
+            let Some(value_end) = pos.checked_add(len) else {
+                break;
+            };
+            if value_end > end {
+                break;
+            }
+            let chunk = &data[pos..value_end];
             let as_str = || std::str::from_utf8(chunk).ok().map(String::from);
             let as_u32 = || chunk.try_into().ok().map(u32::from_be_bytes);
             let as_u16 = || chunk.try_into().ok().map(u16::from_be_bytes);
             match tag {
-                b"minm" => meta.title = as_str(),
-                b"asar" => meta.artist = as_str(),
-                b"asal" => meta.album = as_str(),
-                b"asgn" => meta.genre = as_str(),
-                b"astm" => meta.duration_ms = as_u32(),
-                b"astn" => meta.track_number = as_u16(),
-                b"asdk" => meta.disc_number = as_u16(),
+                b"minm" => {
+                    if let Some(v) = as_str() {
+                        meta.title = Some(v);
+                    }
+                }
+                b"asar" => {
+                    if let Some(v) = as_str() {
+                        meta.artist = Some(v);
+                    }
+                }
+                b"asal" => {
+                    if let Some(v) = as_str() {
+                        meta.album = Some(v);
+                    }
+                }
+                b"asgn" => {
+                    if let Some(v) = as_str() {
+                        meta.genre = Some(v);
+                    }
+                }
+                b"astm" => {
+                    if let Some(v) = as_u32() {
+                        meta.duration_ms = Some(v);
+                    }
+                }
+                b"astn" => {
+                    if let Some(v) = as_u16() {
+                        meta.track_number = Some(v);
+                    }
+                }
+                b"asdk" => {
+                    if let Some(v) = as_u16() {
+                        meta.disc_number = Some(v);
+                    }
+                }
                 _ => {
                     tracing::trace!(tag = %String::from_utf8_lossy(tag), len, "DMAP: unknown tag");
                 }
             }
-            pos += len;
+            pos = value_end;
         }
         tracing::debug!(?meta, "Track metadata parsed");
         meta
@@ -112,5 +156,43 @@ mod tests {
         ];
         let meta = TrackMetadata::from_dmap(data);
         assert_eq!(meta.title, None);
+    }
+
+    #[test]
+    fn dmap_rejects_non_mlit_root() {
+        let data: &[u8] = &[
+            0x6e, 0x6f, 0x70, 0x65, 0x00, 0x00, 0x00, 0x0d, 0x6d, 0x69, 0x6e, 0x6d, 0x00, 0x00,
+            0x00, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f,
+        ];
+        let meta = TrackMetadata::from_dmap(data);
+        assert_eq!(meta.title, None);
+    }
+
+    #[test]
+    fn dmap_respects_declared_outer_length() {
+        let data: &[u8] = &[
+            // mlit length = 13 bytes (one minm chunk)
+            0x6d, 0x6c, 0x69, 0x74, 0x00, 0x00, 0x00, 0x0d,
+            // minm = "Hello"
+            0x6d, 0x69, 0x6e, 0x6d, 0x00, 0x00, 0x00, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f,
+            // Extra bytes beyond declared mlit payload must be ignored.
+            0x6d, 0x69, 0x6e, 0x6d, 0x00, 0x00, 0x00, 0x05, 0x57, 0x6f, 0x72, 0x6c, 0x64,
+        ];
+        let meta = TrackMetadata::from_dmap(data);
+        assert_eq!(meta.title.as_deref(), Some("Hello"));
+    }
+
+    #[test]
+    fn dmap_malformed_duplicate_does_not_clear_prior_value() {
+        let data: &[u8] = &[
+            // mlit length = 23 bytes
+            0x6d, 0x6c, 0x69, 0x74, 0x00, 0x00, 0x00, 0x17,
+            // astm (u32) = 1000
+            0x61, 0x73, 0x74, 0x6d, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x03, 0xE8,
+            // malformed astm length (3 bytes)
+            0x61, 0x73, 0x74, 0x6d, 0x00, 0x00, 0x00, 0x03, 0x01, 0x02, 0x03,
+        ];
+        let meta = TrackMetadata::from_dmap(data);
+        assert_eq!(meta.duration_ms, Some(1000));
     }
 }

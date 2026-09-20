@@ -48,25 +48,32 @@ pub(crate) struct DacpRemoteControl {
     client: crate::dacp::DacpClient,
 }
 
+fn ip_addr_from_remote(remote_addr: &[u8]) -> Option<std::net::IpAddr> {
+    match remote_addr.len() {
+        4 => Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            remote_addr[0],
+            remote_addr[1],
+            remote_addr[2],
+            remote_addr[3],
+        ))),
+        16 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(remote_addr);
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)))
+        }
+        _ => None,
+    }
+}
+
 impl DacpRemoteControl {
     /// Create a new DACP remote control client for the given iPhone.
     pub(crate) fn new(dacp_id: &str, active_remote: &str, remote_addr: &[u8]) -> Self {
         let mut client = crate::dacp::DacpClient::new(dacp_id, active_remote);
-        let ip = match remote_addr.len() {
-            4 => std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                remote_addr[0],
-                remote_addr[1],
-                remote_addr[2],
-                remote_addr[3],
-            )),
-            16 => {
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(remote_addr);
-                std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets))
-            }
-            _ => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        };
-        client.discover_from_remote(ip);
+        if let Some(ip) = ip_addr_from_remote(remote_addr) {
+            client.discover_from_remote(ip);
+        } else {
+            tracing::warn!(len = remote_addr.len(), "Invalid DACP remote address length");
+        }
         Self { client }
     }
 }
@@ -96,5 +103,40 @@ impl RemoteControl for DacpRemoteControl {
             RemoteCommand::ToggleRepeat,
             RemoteCommand::Stop,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ip_addr_from_remote_parses_ipv4() {
+        let ip = ip_addr_from_remote(&[192, 168, 1, 9]);
+        assert_eq!(
+            ip,
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 9)))
+        );
+    }
+
+    #[test]
+    fn ip_addr_from_remote_parses_ipv6() {
+        let ip = ip_addr_from_remote(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]);
+        assert_eq!(
+            ip,
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+                0x2001, 0x0db8, 0, 0, 0, 0, 0, 1
+            )))
+        );
+    }
+
+    #[test]
+    fn ip_addr_from_remote_rejects_invalid_lengths() {
+        assert_eq!(ip_addr_from_remote(&[]), None);
+        assert_eq!(ip_addr_from_remote(&[127, 0, 0]), None);
+        assert_eq!(ip_addr_from_remote(&[0u8; 15]), None);
+        assert_eq!(ip_addr_from_remote(&[0u8; 17]), None);
     }
 }

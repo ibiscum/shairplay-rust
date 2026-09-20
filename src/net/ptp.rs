@@ -117,14 +117,16 @@ pub fn parse_follow_up(buf: &[u8]) -> Option<(u64, u64, i64)> {
     let seconds_hi = u16::from_be_bytes([buf[34], buf[35]]) as u64;
     let seconds_lo = u32::from_be_bytes(buf[36..40].try_into().ok()?) as u64;
     let nanoseconds = u32::from_be_bytes(buf[40..44].try_into().ok()?) as u64;
+    if nanoseconds >= 1_000_000_000 {
+        return None;
+    }
     let seconds = (seconds_hi << 32) | seconds_lo;
-    let timestamp_ns = seconds * 1_000_000_000 + nanoseconds;
+    let timestamp_ns = seconds
+        .checked_mul(1_000_000_000)?
+        .checked_add(nanoseconds)?;
+    let adjusted_timestamp = timestamp_ns.checked_add_signed(correction_ns)?;
 
-    Some((
-        clock_id,
-        timestamp_ns.wrapping_add(correction_ns as u64),
-        correction_ns,
-    ))
+    Some((clock_id, adjusted_timestamp, correction_ns))
 }
 
 /// Parse a PTP Announce message and extract the clock identity.
@@ -330,6 +332,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_follow_up_rejects_invalid_nanoseconds() {
+        let mut buf = vec![0u8; 54];
+        buf[0] = 0x08; // Follow_Up type
+        buf[40..44].copy_from_slice(&1_000_000_000u32.to_be_bytes());
+        assert!(parse_follow_up(&buf).is_none());
+    }
+
+    #[test]
+    fn parse_follow_up_applies_negative_correction() {
+        let mut buf = vec![0u8; 54];
+        buf[0] = 0x08; // Follow_Up type
+        buf[20..28].copy_from_slice(&0xAABBCCDD11223344u64.to_be_bytes());
+        // -1ns in 2^-16ns units.
+        buf[8..16].copy_from_slice(&(-65_536i64).to_be_bytes());
+        buf[36..40].copy_from_slice(&1000u32.to_be_bytes());
+        buf[40..44].copy_from_slice(&500_000_000u32.to_be_bytes());
+
+        let (_, ts, corr) = parse_follow_up(&buf).unwrap();
+        assert_eq!(corr, -1);
+        assert_eq!(ts, 1_000_499_999_999);
+    }
+
+    #[test]
+    fn parse_follow_up_rejects_signed_underflow() {
+        let mut buf = vec![0u8; 54];
+        buf[0] = 0x08; // Follow_Up type
+        // -1ns with zero timestamp should underflow and be rejected.
+        buf[8..16].copy_from_slice(&(-65_536i64).to_be_bytes());
+        assert!(parse_follow_up(&buf).is_none());
+    }
+
+    #[test]
     fn smoother_first_sample_passthrough() {
         let mut s = OffsetSmoother::new();
         let result = s.update(1_000_000, 100_000_000);
@@ -387,8 +421,11 @@ impl PtpAnchor {
         sample_rate: u32,
     ) -> Self {
         // Convert network time to nanoseconds (frac is 64-bit fixed point, MSB = 0.5)
-        let frac_ns = ((network_frac >> 32) * 1_000_000_000) >> 32;
-        let network_time_ns = network_secs * 1_000_000_000 + frac_ns;
+        let frac_ns = ((network_frac as u128) * 1_000_000_000u128) >> 64;
+        let network_time_ns = (network_secs as u128)
+            .saturating_mul(1_000_000_000u128)
+            .saturating_add(frac_ns)
+            .min(u64::MAX as u128) as u64;
         Self {
             clock_id,
             anchor_rtp: rtp_time,
@@ -400,6 +437,10 @@ impl PtpAnchor {
     /// Given a PTP clock offset, compute the local time (ns) when an RTP frame should play.
     /// `ptp_offset` = add to local time to get master time (from PtpClock).
     pub fn local_playout_time(&self, rtp_timestamp: u32, ptp_offset: u64) -> u64 {
+        if self.sample_rate == 0 {
+            // Defensive fallback for malformed or absent sample-rate signaling.
+            return self.anchor_network_time_ns.wrapping_sub(ptp_offset);
+        }
         let frame_diff = rtp_timestamp.wrapping_sub(self.anchor_rtp) as i64;
         let time_diff_ns = (frame_diff * 1_000_000_000) / self.sample_rate as i64;
         let master_playout = (self.anchor_network_time_ns as i64 + time_diff_ns) as u64;
@@ -411,7 +452,7 @@ impl PtpAnchor {
     pub fn delay_until_playout(&self, rtp_timestamp: u32, ptp_offset: u64) -> i64 {
         let target = self.local_playout_time(rtp_timestamp, ptp_offset);
         let now = now_ns();
-        target as i64 - now as i64
+        (target as i128 - now as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64
     }
 }
 
@@ -449,5 +490,12 @@ mod anchor_tests {
         // frac = 0x8000000000000000 means 0.5 seconds
         let anchor = PtpAnchor::new(1, 0, 1, 0x8000_0000_0000_0000, 44100);
         assert_eq!(anchor.anchor_network_time_ns, 1_500_000_000);
+    }
+
+    #[test]
+    fn anchor_zero_sample_rate_falls_back_to_anchor_time() {
+        let anchor = PtpAnchor::new(1, 1234, 5, 0, 0);
+        let local = anchor.local_playout_time(5678, 100);
+        assert_eq!(local, 4_999_999_900);
     }
 }

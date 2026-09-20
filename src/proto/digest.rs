@@ -72,14 +72,20 @@ pub fn is_valid(
     authorization: Option<&str>,
 ) -> bool {
     let auth = match authorization {
-        Some(a) => a,
+        Some(a) => a.trim(),
         None => return false,
     };
 
-    if !auth.starts_with("Digest") {
+    let Some((scheme, params)) = auth.split_once(char::is_whitespace) else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("Digest") {
         return false;
     }
-    let params = &auth[6..];
+    let params = params.trim_start();
+    if params.is_empty() {
+        return false;
+    }
 
     let mut username = None;
     let mut auth_realm = None;
@@ -87,7 +93,7 @@ pub fn is_valid(
     let mut auth_uri = None;
     let mut response = None;
 
-    for part in params.split(',') {
+    for part in split_quoted_csv(params) {
         let part = part.trim();
         if let Some(val) = extract_quoted(part, "username") {
             username = Some(val);
@@ -119,10 +125,101 @@ pub fn is_valid(
 
 /// Extract a quoted value from a "key=\"value\"" pair.
 fn extract_quoted<'a>(part: &'a str, key: &str) -> Option<&'a str> {
-    let prefix = format!("{key}=\"");
-    if part.starts_with(&prefix) && part.ends_with('"') {
-        Some(&part[prefix.len()..part.len() - 1])
-    } else {
-        None
+    let (lhs, rhs) = part.split_once('=')?;
+    if !lhs.trim().eq_ignore_ascii_case(key) {
+        return None;
+    }
+    let rhs = rhs.trim();
+    if rhs.len() < 2 || !rhs.starts_with('"') || !rhs.ends_with('"') {
+        return None;
+    }
+    Some(&rhs[1..rhs.len() - 1])
+}
+
+/// Split a comma-separated auth parameter string without breaking quoted commas.
+fn split_quoted_csv(input: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut in_quotes = false;
+    let mut start = 0usize;
+
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                out.push(&input[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&input[start..]);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_digest_with_mixed_case_scheme_and_spaced_keys() {
+        let realm = "raop";
+        let password = "secret";
+        let nonce = "0011223344556677";
+        let method = "SETUP";
+        let uri = "/stream";
+        let username = "alice";
+        let response = get_response(username, realm, password, nonce, method, uri);
+        let auth = format!(
+            "digest username = \"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{response}\""
+        );
+
+        assert!(is_valid(
+            realm,
+            password,
+            nonce,
+            method,
+            uri,
+            Some(&auth)
+        ));
+    }
+
+    #[test]
+    fn rejects_scheme_prefix_confusion() {
+        let auth = "DigestX username=\"u\", realm=\"r\", nonce=\"n\", uri=\"/\", response=\"x\"";
+        assert!(!is_valid("r", "p", "n", "GET", "/", Some(auth)));
+    }
+
+    #[test]
+    fn supports_commas_inside_quoted_values() {
+        let realm = "raop";
+        let password = "secret";
+        let nonce = "0011223344556677";
+        let method = "POST";
+        let uri = "/announce";
+        let username = "alice,bob";
+        let response = get_response(username, realm, password, nonce, method, uri);
+        let auth = format!(
+            "Digest username=\"{username}\",realm=\"{realm}\",nonce=\"{nonce}\",uri=\"{uri}\",response=\"{response}\""
+        );
+
+        assert!(is_valid(
+            realm,
+            password,
+            nonce,
+            method,
+            uri,
+            Some(&auth)
+        ));
+    }
+
+    #[test]
+    fn nonce_generation_is_hex_and_capped() {
+        let short = generate_nonce(8);
+        assert_eq!(short.len(), 8);
+        assert!(short.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let capped = generate_nonce(128);
+        assert_eq!(capped.len(), 32);
+        assert!(capped.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

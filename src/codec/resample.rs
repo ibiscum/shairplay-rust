@@ -14,19 +14,17 @@ pub(crate) struct StreamResampler {
     chunk_size: usize,
     /// Accumulated input samples (interleaved).
     pending: Vec<f32>,
-    /// Whether the initial delay has been flushed.
-    warmed_up: bool,
 }
 
 impl StreamResampler {
     /// Create a new resampler. Returns `None` if rates are equal.
     pub(crate) fn new(from_rate: u32, to_rate: u32, channels: usize) -> Option<Self> {
-        if from_rate == to_rate {
+        if from_rate == to_rate || channels == 0 {
             return None;
         }
         let params = SincInterpolationParameters {
             sinc_len: 64,
-            f_cutoff: 0.95,
+            f_cutoff: Some(0.95),
             interpolation: SincInterpolationType::Linear,
             oversampling_factor: 128,
             window: WindowFunction::BlackmanHarris2,
@@ -41,11 +39,13 @@ impl StreamResampler {
             channels,
             chunk_size,
             pending: Vec::new(),
-            warmed_up: false,
         })
     }
 
     /// Resample interleaved F32 audio. Returns resampled interleaved F32.
+    ///
+    /// Any trailing partial chunk is retained internally and emitted once enough
+    /// future samples arrive to form a full processing chunk.
     pub(crate) fn process(&mut self, interleaved: &[f32]) -> Vec<f32> {
         self.pending.extend_from_slice(interleaved);
 
@@ -70,13 +70,9 @@ impl StreamResampler {
                 Err(_) => continue,
             };
 
-            if let Ok(result) = self.resampler.process(&input, 0, None) {
+            if let Ok(result) = self.resampler.process(&input, None) {
                 let data = result.take_data();
                 if !data.is_empty() {
-                    if !self.warmed_up {
-                        // Skip initial silence from sinc filter warmup
-                        self.warmed_up = true;
-                    }
                     output.extend(data);
                 }
             }
@@ -88,11 +84,14 @@ impl StreamResampler {
 
 /// ITU-R BS.775 downmix coefficient (−3 dB) applied to centre and surround
 /// channels when folding 5.1/7.1 into stereo.
-const DOWNMIX_3DB: f32 = 0.707;
+const DOWNMIX_3DB: f32 = 0.707_106_77;
 
 /// Mix down multi-channel F32 audio to fewer channels.
 /// Uses ITU-R BS.775 downmix coefficients for 5.1 and 7.1.
 pub(crate) fn mixdown(input: &[f32], in_channels: usize, out_channels: usize) -> Vec<f32> {
+    if in_channels == 0 {
+        return Vec::new();
+    }
     if in_channels == out_channels {
         return input.to_vec();
     }
@@ -187,6 +186,32 @@ mod tests {
     #[test]
     fn resample_passthrough_returns_none() {
         assert!(StreamResampler::new(44100, 44100, 2).is_none());
+    }
+
+    #[test]
+    fn resampler_zero_channels_returns_none() {
+        assert!(StreamResampler::new(44100, 48000, 0).is_none());
+    }
+
+    #[test]
+    fn mixdown_zero_input_channels_returns_empty() {
+        let out = mixdown(&[0.1, 0.2, 0.3, 0.4], 0, 2);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn resample_buffers_partial_chunk_until_enough_input() {
+        let mut rs = StreamResampler::new(44100, 96000, 2).unwrap();
+
+        // 100 stereo frames < internal chunk size (128), so output stays buffered.
+        let partial = vec![0.0_f32; 100 * 2];
+        let out1 = rs.process(&partial);
+        assert!(out1.is_empty());
+
+        // Add 28 stereo frames to cross one full chunk; now output should be produced.
+        let complete = vec![0.0_f32; 28 * 2];
+        let out2 = rs.process(&complete);
+        assert!(!out2.is_empty());
     }
 }
 

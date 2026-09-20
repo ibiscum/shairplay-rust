@@ -69,6 +69,45 @@ impl Default for Ap1Advertisement {
     }
 }
 
+#[cfg(test)]
+mod ap1_advertisement_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_stable_and_interoperable() {
+        let adv = Ap1Advertisement::default();
+        assert_eq!(adv.codecs_txt(), "0,1");
+        assert_eq!(adv.encryption_txt(), "0");
+    }
+
+    #[test]
+    fn custom_order_is_preserved() {
+        let adv = Ap1Advertisement::try_new(
+            Some(vec![Ap1Codec::Alac, Ap1Codec::Pcm]),
+            Some(vec![Ap1Encryption::FairPlay, Ap1Encryption::Rsa]),
+        )
+        .unwrap();
+        assert_eq!(adv.codecs_txt(), "1,0");
+        assert_eq!(adv.encryption_txt(), "3,1");
+    }
+
+    #[test]
+    fn rejects_empty_and_duplicate_configurations() {
+        assert!(Ap1Advertisement::try_new(Some(Vec::new()), None).is_err());
+        assert!(Ap1Advertisement::try_new(None, Some(Vec::new())).is_err());
+        assert!(Ap1Advertisement::try_new(
+            Some(vec![Ap1Codec::Pcm, Ap1Codec::Pcm]),
+            None
+        )
+        .is_err());
+        assert!(Ap1Advertisement::try_new(
+            None,
+            Some(vec![Ap1Encryption::None, Ap1Encryption::None]),
+        )
+        .is_err());
+    }
+}
+
 fn configured_or_default<T: Copy + Eq>(
     configured: Option<Vec<T>>,
     default: &[T],

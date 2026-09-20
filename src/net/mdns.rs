@@ -317,10 +317,11 @@ impl MdnsService {
         )
         .map(|svc| svc.enable_addr_auto())
         .map_err(|e| NetworkError::Mdns(format!("{e}")))?;
-        self.raop_fullname = Some(svc.get_fullname().to_string());
+        let fullname = svc.get_fullname().to_string();
         self.daemon
             .register(svc)
             .map_err(|e| NetworkError::Mdns(format!("{e}")))?;
+        self.raop_fullname = Some(fullname);
         tracing::info!(name = %info.raop_name, port = info.port, "mDNS: _raop._tcp registered");
         Ok(())
     }
@@ -341,10 +342,11 @@ impl MdnsService {
         )
         .map(|svc| svc.enable_addr_auto())
         .map_err(|e| NetworkError::Mdns(format!("{e}")))?;
-        self.airplay_fullname = Some(svc.get_fullname().to_string());
+        let fullname = svc.get_fullname().to_string();
         self.daemon
             .register(svc)
             .map_err(|e| NetworkError::Mdns(format!("{e}")))?;
+        self.airplay_fullname = Some(fullname);
         tracing::info!(name = %info.airplay_name, port = info.port, "mDNS: _airplay._tcp registered");
         Ok(())
     }
@@ -370,6 +372,73 @@ impl Drop for MdnsService {
         self.unregister_raop();
         self.unregister_airplay();
         let _ = self.daemon.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod ap1_tests {
+    use super::*;
+
+    #[test]
+    fn ap1_raop_txt_has_required_fields() {
+        let info = AirPlayServiceInfo::new(
+            "Test Speaker",
+            7000,
+            &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            true,
+        );
+
+        let find = |key: &str| {
+            info.raop_txt
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+
+        assert_eq!(find("txtvers"), Some("1"));
+        assert_eq!(find("ch"), Some("2"));
+        assert_eq!(find("sv"), Some("false"));
+        assert_eq!(find("da"), Some("true"));
+        assert_eq!(find("sr"), Some("44100"));
+        assert_eq!(find("ss"), Some("16"));
+        assert_eq!(find("pw"), Some("true"));
+        assert_eq!(find("vn"), Some("3"));
+        assert_eq!(find("tp"), Some("TCP,UDP"));
+        assert_eq!(find("md"), Some("0,1,2"));
+        assert_eq!(find("ek"), Some("1"));
+    }
+
+    #[test]
+    fn ap1_airplay_txt_has_required_fields() {
+        let info = AirPlayServiceInfo::new(
+            "Test Speaker",
+            7000,
+            &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            false,
+        );
+
+        let find = |key: &str| {
+            info.airplay_txt
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+
+        assert_eq!(find("deviceid"), Some("aa:bb:cc:dd:ee:ff"));
+        assert_eq!(find("features"), Some("0x7"));
+        assert_eq!(find("model"), Some(GLOBAL_MODEL));
+    }
+
+    #[test]
+    fn ap1_raop_name_format() {
+        let info = AirPlayServiceInfo::new(
+            "My Speaker",
+            5000,
+            &[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC],
+            false,
+        );
+        assert_eq!(info.raop_name, "123456789ABC@My Speaker");
+        assert_eq!(info.airplay_name, "My Speaker");
     }
 }
 

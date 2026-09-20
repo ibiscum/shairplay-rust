@@ -67,8 +67,7 @@ pub(crate) fn handle_play(
     let session = hls_handler.on_play(url, start_pos);
 
     if let Ok(mut state) = conn.hls_state.lock() {
-        state.session = Some(session);
-        state.session_id = session_id;
+        state.replace_session(session, session_id);
     }
     None
 }
@@ -86,6 +85,7 @@ pub(crate) fn handle_playback_info(
     let position = session.position() as f64;
     let rate = session.rate() as f64;
     let ready = session.ready();
+    let loaded_duration = (duration - position).max(0.0);
 
     let mut dict = plist::Dictionary::new();
     dict.insert("duration".into(), plist::Value::Real(duration));
@@ -111,7 +111,7 @@ pub(crate) fn handle_playback_info(
     // loadedTimeRanges
     let mut loaded = plist::Dictionary::new();
     loaded.insert("start".into(), plist::Value::Real(position));
-    loaded.insert("duration".into(), plist::Value::Real(duration - position));
+    loaded.insert("duration".into(), plist::Value::Real(loaded_duration));
     dict.insert(
         "loadedTimeRanges".into(),
         plist::Value::Array(vec![plist::Value::Dictionary(loaded)]),
@@ -174,11 +174,7 @@ pub(crate) fn handle_stop(
 ) -> Option<Vec<u8>> {
     tracing::info!("HLS stop");
     if let Ok(mut state) = conn.hls_state.lock() {
-        if let Some(session) = state.session.as_mut() {
-            session.stop();
-        }
-        state.session = None;
-        state.session_id = None;
+        state.clear_session();
     }
     None
 }
@@ -187,8 +183,15 @@ pub(crate) fn handle_stop(
 fn parse_query_float(url: &str, key: &str) -> Option<f32> {
     let query = url.split('?').nth(1)?;
     for param in query.split('&') {
-        if let Some(val) = param.strip_prefix(key).and_then(|s| s.strip_prefix('=')) {
-            return val.parse().ok();
+        let Some((param_key, val)) = param.split_once('=') else {
+            continue;
+        };
+        if param_key == key {
+            let parsed = val.parse::<f32>().ok()?;
+            if parsed.is_finite() {
+                return Some(parsed);
+            }
+            return None;
         }
     }
     None
@@ -226,5 +229,20 @@ mod tests {
     fn parse_query_float_invalid() {
         assert_eq!(parse_query_float("/scrub?position=abc", "position"), None);
         assert_eq!(parse_query_float("/scrub?position=", "position"), None);
+    }
+
+    #[test]
+    fn parse_query_float_rejects_non_finite() {
+        assert_eq!(parse_query_float("/rate?value=NaN", "value"), None);
+        assert_eq!(parse_query_float("/rate?value=inf", "value"), None);
+        assert_eq!(parse_query_float("/rate?value=-inf", "value"), None);
+    }
+
+    #[test]
+    fn parse_query_float_requires_exact_key_match() {
+        assert_eq!(
+            parse_query_float("/scrub?positionMs=1.5&position=2.0", "position"),
+            Some(2.0)
+        );
     }
 }

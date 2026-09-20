@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Bug Fixes
+
+* **deps:** pin AP2 `hkdf` to the digest-0.10-compatible line to restore `--features ap2` builds
+* **codec:** enforce ALAC profile/config bounds and reject invalid frame channel/sample declarations
+* **codec:** harden resampler/mixdown channel validation and document partial-chunk buffering behavior
+* **crypto:** clarify AES-CTR module scope and add counter-carry/empty-input regression tests
+* **crypto:** harden ChaCha transport framing/counter handling and classify AP2 transport crypto errors explicitly
+* **crypto:** document FairPlay garble helper quirks and pin helper edge semantics with regression tests
+
 ## [0.10.0](https://github.com/metaneutrons/shairplay-rust/compare/v0.9.1...v0.10.0) (2026-09-06)
 
 

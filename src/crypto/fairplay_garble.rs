@@ -11,6 +11,13 @@
     reason = "register names and explicit expression grouping mirror the fixed transformation"
 )]
 
+/// Mechanical port of the C helper used by hand_garble.
+///
+/// This is intentionally *not* a normal rotate helper:
+/// - `count == 0` returns `0` (instead of `input`), and
+/// - output is widened to `u32`.
+///
+/// Keep this behavior exactly for vector parity.
 fn weird_ror8(input: u8, count: u32) -> u32 {
     if count == 0 {
         return 0;
@@ -19,6 +26,11 @@ fn weird_ror8(input: u8, count: u32) -> u32 {
     ((input as u32 >> c) & 0xff) | ((input as u32 & 0xff) << (8u32.wrapping_sub(c)))
 }
 
+/// Mechanical port of the C helper used by hand_garble.
+///
+/// Intentional quirks for vector parity:
+/// - `count == 0` returns `0`,
+/// - output is widened to `u32`.
 fn weird_rol8(input: u8, count: u32) -> u32 {
     if count == 0 {
         return 0;
@@ -27,6 +39,10 @@ fn weird_rol8(input: u8, count: u32) -> u32 {
     (((input as u32) << c) & 0xff) | ((input as u32) >> (8u32.wrapping_sub(c)))
 }
 
+/// Mechanical port of the C helper used by hand_garble.
+///
+/// Despite the name this consumes an 8-bit input and combines shifted halves
+/// via XOR, matching the original C expression exactly.
 fn weird_rol32(input: u8, count: u32) -> u32 {
     if count == 0 {
         return 0;
@@ -34,10 +50,12 @@ fn weird_rol32(input: u8, count: u32) -> u32 {
     ((input as u32) << count) ^ ((input as u32) >> (8u32.wrapping_sub(count)))
 }
 
+/// Normal 8-bit rotate-left helper used by the translated expression stream.
 fn rol8(x: u8, y: u32) -> u8 {
     (((x as u16) << (y & 7)) | ((x as u16) >> (8 - (y & 7)))) as u8
 }
 
+/// Widened 8-bit rotate-left helper (`u8` input, `u32` output).
 fn rol8x(x: u8, y: u32) -> u32 {
     ((x as u32) << (y & 7)) | ((x as u32) >> (8u32.wrapping_sub(y & 7)))
 }
@@ -625,7 +643,22 @@ pub(crate) fn garble(
 #[cfg(test)]
 #[rustfmt::skip]
 mod tests {
-    use super::garble;
+    use super::{garble, weird_rol8, weird_rol32, weird_ror8};
+
+    #[test]
+    fn weird_rotate_helpers_preserve_c_edge_semantics() {
+        // These are intentionally non-standard and must not be "fixed".
+        assert_eq!(weird_ror8(0xA5, 0), 0);
+        assert_eq!(weird_rol8(0xA5, 0), 0);
+        assert_eq!(weird_rol32(0xA5, 0), 0);
+
+        assert_eq!(weird_ror8(0xA5, 8), 0xA5A5);
+        assert_eq!(weird_rol8(0xA5, 8), 0xA5);
+
+        // XOR-composed helper semantics differ from a normal rotate.
+        assert_eq!(weird_rol32(0x12, 1), 0x24);
+        assert_eq!(weird_rol32(0x80, 7), 0x4000 ^ 0x40);
+    }
 
     /// Run garble with deterministic input (same seed pattern as C test harness)
     /// and compare all four output buffers against precomputed interoperability vectors.

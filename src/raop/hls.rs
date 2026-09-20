@@ -48,16 +48,46 @@ impl HlsState {
             session_id: None,
         }))
     }
+
+    /// Install a new playback session, stopping any existing one first.
+    pub(crate) fn replace_session(
+        &mut self,
+        session: Box<dyn HlsSession>,
+        session_id: Option<String>,
+    ) {
+        if let Some(mut current) = self.session.take() {
+            current.stop();
+        }
+        self.session = Some(session);
+        self.session_id = session_id;
+    }
+
+    /// Stop and remove the active playback session, if any.
+    pub(crate) fn clear_session(&mut self) {
+        if let Some(mut current) = self.session.take() {
+            current.stop();
+        }
+        self.session_id = None;
+    }
+}
+
+impl Drop for HlsState {
+    fn drop(&mut self) {
+        self.clear_session();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockSession {
         pos: f32,
         rate: f32,
         stopped: bool,
+        stop_count: Arc<AtomicUsize>,
     }
 
     impl HlsSession for MockSession {
@@ -79,12 +109,23 @@ mod tests {
         fn stop(&mut self) {
             self.stopped = true;
             self.rate = 0.0;
+            self.stop_count.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    fn mock_session(stop_count: Arc<AtomicUsize>) -> Box<dyn HlsSession> {
+        Box::new(MockSession {
+            pos: 0.0,
+            rate: 1.0,
+            stopped: false,
+            stop_count,
+        })
     }
 
     #[test]
     fn hls_state_lifecycle() {
         let state = HlsState::new();
+        let stop_count = Arc::new(AtomicUsize::new(0));
         {
             let s = state.lock().unwrap();
             assert!(s.session.is_none());
@@ -93,12 +134,7 @@ mod tests {
         // Simulate /play
         {
             let mut s = state.lock().unwrap();
-            s.session = Some(Box::new(MockSession {
-                pos: 0.0,
-                rate: 1.0,
-                stopped: false,
-            }));
-            s.session_id = Some("test-123".into());
+            s.replace_session(mock_session(stop_count.clone()), Some("test-123".into()));
         }
 
         // Simulate /playback-info poll
@@ -126,12 +162,42 @@ mod tests {
         // Simulate /stop
         {
             let mut s = state.lock().unwrap();
-            s.session.as_mut().unwrap().stop();
-            assert_eq!(s.session.as_ref().unwrap().rate(), 0.0);
-            s.session = None;
+            s.clear_session();
         }
 
         let s = state.lock().unwrap();
         assert!(s.session.is_none());
+        assert_eq!(s.session_id, None);
+        assert_eq!(stop_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn replace_session_stops_previous() {
+        let state = HlsState::new();
+        let stop_count = Arc::new(AtomicUsize::new(0));
+
+        {
+            let mut s = state.lock().unwrap();
+            s.replace_session(mock_session(stop_count.clone()), Some("first".into()));
+            s.replace_session(mock_session(stop_count.clone()), Some("second".into()));
+            assert_eq!(s.session_id.as_deref(), Some("second"));
+        }
+
+        assert_eq!(stop_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn dropping_state_stops_active_session() {
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        let mut state = HlsState {
+            session: Some(mock_session(stop_count.clone())),
+            session_id: Some("drop-test".into()),
+        };
+
+        state.replace_session(mock_session(stop_count.clone()), Some("updated".into()));
+        assert_eq!(stop_count.load(Ordering::Relaxed), 1);
+
+        drop(state);
+        assert_eq!(stop_count.load(Ordering::Relaxed), 2);
     }
 }
