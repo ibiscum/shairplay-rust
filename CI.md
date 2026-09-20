@@ -344,59 +344,6 @@ cargo machete
 cargo llvm-cov --workspace --all-features --html
 ```
 
-## Opt-in Audio Backend Tests
-
-Real audio backend tests are intentionally excluded from default test runs.
-They depend on host audio services or hardware and can be flaky in generic CI.
-
-### Why These Are Opt-in
-
-- Device availability differs by machine and runner.
-- Backend capabilities vary (for example, pause support is not universal).
-- Shared CI environments rarely provide stable, deterministic audio stacks.
-
-### CPAL via Pulse Virtual Sink (env-gated)
-
-Test: `output::tests::cpal_e2e_via_pulse_virtual_sink_opt_in`
-
-Runs only when `RMPD_E2E_AUDIO_TEST=1`.
-
-```bash
-RMPD_E2E_AUDIO_TEST=1 \
-cargo test -p rmpd-player cpal_e2e_via_pulse_virtual_sink_opt_in -- --nocapture --test-threads=1
-```
-
-### CPAL with Concrete Hardware Device (env-gated)
-
-Test: `output::tests::cpal_e2e_with_configured_hardware_device_opt_in`
-
-Runs only when both are set:
-
-- `RMPD_HW_AUDIO_TEST=1`
-- `RMPD_HW_AUDIO_DEVICE=<device id>` (example: `hw:CARD=1,DEV=0`)
-
-```bash
-RMPD_HW_AUDIO_TEST=1 \
-RMPD_HW_AUDIO_DEVICE=hw:CARD=1,DEV=0 \
-cargo test -p rmpd-player cpal_e2e_with_configured_hardware_device_opt_in -- --nocapture --test-threads=1
-```
-
-To discover valid device ids on your host:
-
-```bash
-cargo run -p rmpd-player --example list_devices
-```
-
-### PipeWire Roundtrip (ignored by default)
-
-Test: `pipewire_output::tests::start_write_stop_roundtrip`
-
-This test is marked `#[ignore]` and requires a running PipeWire server.
-
-```bash
-cargo test -p rmpd-player start_write_stop_roundtrip -- --ignored --nocapture --test-threads=1
-```
-
 ### Suggested CI Strategy
 
 - Keep `cargo test --workspace --all-features` as the default required gate.

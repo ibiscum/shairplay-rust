@@ -16,6 +16,10 @@ readme = "README.md"
 homepage = "https://github.com/metaneutrons/shairplay-rust"
 repository = "https://github.com/metaneutrons/shairplay-rust"
 # rust-version = "1.94"
+
+[profile.release]
+debug = true
+
 include = [
     "/src/**",
     "/examples/**",
@@ -24,6 +28,8 @@ include = [
     "/Cargo.lock",
     "/README.md",
     "/CHANGELOG.md",
+    "/CI.md",
+    "/CONTRIBUTING.md",
     "/LICENSE",
     "/AP2-STATUS.md",
     "/docs/**",
