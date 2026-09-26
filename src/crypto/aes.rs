@@ -69,6 +69,10 @@ impl AesCtr {
 mod tests {
     use super::*;
 
+    fn random_key_nonce() -> ([u8; 16], [u8; 16]) {
+        (rand::random::<[u8; 16]>(), rand::random::<[u8; 16]>())
+    }
+
     fn inc_counter_be(counter: &mut [u8; BLOCK_SIZE]) {
         let mut carry: u16 = 1;
         for i in (0..BLOCK_SIZE).rev() {
@@ -80,8 +84,7 @@ mod tests {
 
     #[test]
     fn aes_ctr_empty_input_is_noop() {
-        let key = [0x11; 16];
-        let nonce = [0x22; 16];
+        let (key, nonce) = random_key_nonce();
         let mut ctr = AesCtr::new(&key, &nonce);
         let mut data = Vec::<u8>::new();
         ctr.encrypt(&mut data);
@@ -93,7 +96,7 @@ mod tests {
     fn aes_ctr_counter_carry_matches_manual_keystream() {
         // Start at ..FF so the second block checks carry propagation into the
         // next byte (..00 with carry into byte 14).
-        let key = [0x42; 16];
+        let key = rand::random::<[u8; 16]>();
         let mut counter = [0u8; 16];
         counter[15] = 0xFF;
 

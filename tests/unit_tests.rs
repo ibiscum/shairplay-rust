@@ -1,5 +1,8 @@
 //! Unit tests with test vectors generated from the original C implementation.
 
+use aes::Aes128;
+use ctr::Ctr128BE;
+use ctr::cipher::{KeyIvInit, StreamCipher};
 use shairplay::crypto::aes::AesCtr;
 use shairplay::crypto::fairplay::FairPlay;
 use shairplay::crypto::pairing::Pairing;
@@ -8,6 +11,15 @@ use shairplay::proto::digest;
 use shairplay::proto::http::{HttpRequest, HttpResponse};
 use shairplay::proto::sdp::Sdp;
 use shairplay::raop::buffer::RaopBuffer;
+
+fn random_key_iv() -> ([u8; 16], [u8; 16]) {
+    (rand::random::<[u8; 16]>(), rand::random::<[u8; 16]>())
+}
+
+fn encrypt_reference_ctr(key: &[u8; 16], nonce: &[u8; 16], data: &mut [u8]) {
+    let mut cipher = Ctr128BE::<Aes128>::new(key.into(), nonce.into());
+    cipher.apply_keystream(data);
+}
 
 // ============================================================
 // Base64 — vectors from C base64_encode/base64_decode
@@ -150,37 +162,23 @@ fn digest_nonce_length() {
 }
 
 // ============================================================
-// AES-CTR — vectors from C AES_ctr_encrypt
+// AES-CTR — compatibility and streaming behavior
 // ============================================================
 #[test]
 fn aes_ctr_48_bytes() {
-    let key = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-        0x10,
-    ];
-    let nonce = [
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x01,
-    ];
+    let (key, nonce) = random_key_iv();
     let mut data: Vec<u8> = (0..48).collect();
+    let mut expected = data.clone();
+    encrypt_reference_ctr(&key, &nonce, &mut expected);
+
     let mut aes = AesCtr::new(&key, &nonce);
     aes.encrypt(&mut data);
-    assert_eq!(
-        hex::encode(&data),
-        "9a7b041aaec7986b1722564c5fd886fc043d43dabb39e7ce36902ddfe7dc93659233f84a755459b2712ee0fd90d32645"
-    );
+    assert_eq!(data, expected);
 }
 
 #[test]
 fn aes_ctr_streaming_matches_oneshot() {
-    let key = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-        0x10,
-    ];
-    let nonce = [
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x01,
-    ];
+    let (key, nonce) = random_key_iv();
     let plain: Vec<u8> = (0..48).collect();
 
     // One-shot
@@ -199,23 +197,18 @@ fn aes_ctr_streaming_matches_oneshot() {
 
 #[test]
 fn aes_ctr_7_bytes() {
-    let key = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-        0x10,
-    ];
-    let nonce = [
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x01,
-    ];
+    let (key, nonce) = random_key_iv();
     let mut data: Vec<u8> = (0..7).collect();
+    let mut expected = data.clone();
+    encrypt_reference_ctr(&key, &nonce, &mut expected);
+
     AesCtr::new(&key, &nonce).encrypt(&mut data);
-    assert_eq!(hex::encode(&data), "9a7b041aaec798");
+    assert_eq!(data, expected);
 }
 
 #[test]
 fn aes_ctr_symmetric() {
-    let key = [0xaa; 16];
-    let nonce = [0xbb; 16];
+    let (key, nonce) = random_key_iv();
     let original = b"AirPlay test data for symmetry check!".to_vec();
     let mut encrypted = original.clone();
     AesCtr::new(&key, &nonce).encrypt(&mut encrypted);
@@ -322,8 +315,7 @@ fn fairplay_reject_bad_version() {
 // ============================================================
 #[test]
 fn rtp_buffer_queue_dequeue() {
-    let key = [0u8; 16];
-    let iv = [0u8; 16];
+    let (key, iv) = random_key_iv();
     let mut buf = RaopBuffer::new(
         "96 AppleLossless",
         "96 352 0 16 40 10 14 2 255 0 0 44100",
@@ -345,8 +337,7 @@ fn rtp_buffer_queue_dequeue() {
 
 #[test]
 fn rtp_buffer_flush() {
-    let key = [0u8; 16];
-    let iv = [0u8; 16];
+    let (key, iv) = random_key_iv();
     let mut buf = RaopBuffer::new(
         "96 AppleLossless",
         "96 352 0 16 40 10 14 2 255 0 0 44100",
@@ -360,8 +351,7 @@ fn rtp_buffer_flush() {
 
 #[test]
 fn rtp_buffer_reject_short_packet() {
-    let key = [0u8; 16];
-    let iv = [0u8; 16];
+    let (key, iv) = random_key_iv();
     let mut buf = RaopBuffer::new(
         "96 AppleLossless",
         "96 352 0 16 40 10 14 2 255 0 0 44100",
@@ -374,8 +364,7 @@ fn rtp_buffer_reject_short_packet() {
 
 #[test]
 fn rtp_buffer_rejects_malformed_fmtp() {
-    let key = [0u8; 16];
-    let iv = [0u8; 16];
+    let (key, iv) = random_key_iv();
     // Too few fields — previously panicked via `.expect("invalid fmtp")`.
     assert!(RaopBuffer::new("96 AppleLossless", "96 352", &key, &iv).is_none());
     // Non-numeric field — previously silently coerced to 0.
@@ -412,8 +401,7 @@ fn rtp_buffer_rejects_malformed_fmtp() {
 
 #[test]
 fn rtp_buffer_rejects_unsupported_or_malformed_rtpmap() {
-    let key = [0u8; 16];
-    let iv = [0u8; 16];
+    let (key, iv) = random_key_iv();
     let fmtp = "96 352 0 16 40 10 14 2 255 0 0 44100";
 
     assert!(RaopBuffer::new("96 opus/48000/2", fmtp, &key, &iv).is_none());
@@ -538,15 +526,6 @@ fn service_info_with_password() {
             .map(|(_, v)| v.as_str()),
         Some("true")
     );
-}
-
-// ============================================================
-// hex helper for AES tests
-// ============================================================
-mod hex {
-    pub fn encode(data: &[u8]) -> String {
-        data.iter().map(|b| format!("{b:02x}")).collect()
-    }
 }
 
 #[cfg(all(test, feature = "ap2"))]

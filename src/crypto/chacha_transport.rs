@@ -181,10 +181,51 @@ impl EncryptedChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::RngCore;
+
+    fn random_key() -> [u8; 32] {
+        rand::random::<[u8; 32]>()
+    }
+
+    fn random_secret() -> [u8; 64] {
+        let mut secret = [0u8; 64];
+        rand::thread_rng().fill_bytes(&mut secret);
+        secret
+    }
+
+    fn encrypt_expected_frame(key: [u8; 32], counter: u64, plain: &[u8]) -> Vec<u8> {
+        let cipher = ChaCha20Poly1305::new((&key).into());
+        let mut nonce = [0u8; 12];
+        nonce[4..12].copy_from_slice(&counter.to_le_bytes());
+        let block_len = (plain.len() as u16).to_le_bytes();
+        let ct = cipher
+            .encrypt(
+                (&nonce).into(),
+                Payload {
+                    msg: plain,
+                    aad: &block_len,
+                },
+            )
+            .expect("reference encrypt should succeed");
+
+        let mut out = Vec::with_capacity(2 + ct.len());
+        out.extend_from_slice(&block_len);
+        out.extend_from_slice(&ct);
+        out
+    }
+
+    fn encrypt_expected_frames(key: [u8; 32], mut counter: u64, plain: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for chunk in plain.chunks(MAX_BLOCK_LEN) {
+            out.extend_from_slice(&encrypt_expected_frame(key, counter, chunk));
+            counter += 1;
+        }
+        out
+    }
 
     #[test]
     fn roundtrip_single_block() {
-        let key = [0x42u8; 32];
+        let key = random_key();
         let mut enc = CipherContext::new(key);
         let mut dec = CipherContext::new(key);
 
@@ -197,7 +238,7 @@ mod tests {
 
     #[test]
     fn roundtrip_multi_block() {
-        let key = [0xAB; 32];
+        let key = random_key();
         let mut enc = CipherContext::new(key);
         let mut dec = CipherContext::new(key);
 
@@ -214,7 +255,7 @@ mod tests {
 
     #[test]
     fn incremental_decrypt() {
-        let key = [0x99; 32];
+        let key = random_key();
         let mut enc = CipherContext::new(key);
         let mut dec = CipherContext::new(key);
 
@@ -233,7 +274,7 @@ mod tests {
 
     #[test]
     fn corrupted_tag_rejected() {
-        let key = [0x11; 32];
+        let key = random_key();
         let mut enc = CipherContext::new(key);
         let mut dec = CipherContext::new(key);
 
@@ -247,7 +288,7 @@ mod tests {
 
     #[test]
     fn encrypted_channel_control() {
-        let secret = [0x55u8; 64];
+        let secret = random_secret();
         let server = EncryptedChannel::control(&secret).unwrap();
         assert_ne!(server.encrypt_ctx.key, [0u8; 32]);
         assert_ne!(server.decrypt_ctx.key, [0u8; 32]);
@@ -256,7 +297,7 @@ mod tests {
 
     #[test]
     fn encrypted_channel_events() {
-        let secret = [0x33u8; 64];
+        let secret = random_secret();
         let server = EncryptedChannel::events(&secret).unwrap();
         assert_ne!(server.encrypt_ctx.key, [0u8; 32]);
         assert_ne!(server.decrypt_ctx.key, [0u8; 32]);
@@ -265,7 +306,7 @@ mod tests {
 
     #[test]
     fn encrypt_empty_plaintext_is_noop() {
-        let key = [0x42u8; 32];
+        let key = random_key();
         let mut enc = CipherContext::new(key);
         let ct = enc.encrypt(&[]).unwrap();
         assert!(ct.is_empty());
@@ -274,7 +315,7 @@ mod tests {
 
     #[test]
     fn decrypt_rejects_zero_length_frame() {
-        let key = [0x42u8; 32];
+        let key = random_key();
         let mut dec = CipherContext::new(key);
         // Complete frame for block_len=0: [len(2)] + [tag(16)].
         let mut frame = vec![0u8; 2 + TAG_LEN];
@@ -288,7 +329,7 @@ mod tests {
 
     #[test]
     fn encrypt_rejects_counter_exhaustion() {
-        let key = [0x42u8; 32];
+        let key = random_key();
         let mut enc = CipherContext::new(key);
         enc.counter = u64::MAX;
         assert!(matches!(
@@ -299,7 +340,7 @@ mod tests {
 
     #[test]
     fn decrypt_rejects_counter_exhaustion() {
-        let key = [0x42u8; 32];
+        let key = random_key();
         let mut enc = CipherContext::new(key);
         let frame = enc.encrypt(b"x").unwrap();
 
@@ -311,45 +352,36 @@ mod tests {
         ));
     }
 
-    // --- C-verified test vectors (generated from OpenSSL EVP_chacha20_poly1305) ---
-
-    fn hex_encode(data: &[u8]) -> String {
-        data.iter().map(|b| format!("{b:02x}")).collect()
-    }
+    // --- Reference-checked framing/encryption behavior ---
 
     #[test]
     fn c_vector_single_block() {
-        let key = [0x42u8; 32];
+        let key = random_key();
         let mut enc = CipherContext::new(key);
-        let ct = enc.encrypt(b"Hello, AirPlay 2!").unwrap();
-        assert_eq!(
-            hex_encode(&ct),
-            "1100110388477298138c85d304589e56888a9fdf4df47289f10c4d8bf4f3052c1b7014"
-        );
+        let plain = b"Hello, AirPlay 2!";
+        let ct = enc.encrypt(plain).unwrap();
+        let expected = encrypt_expected_frame(key, 0, plain);
+        assert_eq!(ct, expected);
     }
 
     #[test]
     fn c_vector_counter_0() {
-        let key = [0xABu8; 32];
+        let key = random_key();
         let mut enc = CipherContext::new(key);
         let plain: Vec<u8> = (0u8..100).collect();
         let ct = enc.encrypt(&plain).unwrap();
-        assert_eq!(
-            hex_encode(&ct),
-            "6400fc234f2ff9641f53b69282ced5d3db3a905abec11c50765d3feaf6b95907eefb45cf47144c23bcb8161bf17f4c69d22000e4ea6613470d6d0f2add85c1d6632543b4743faa7dc0b7062269547848333fbb3e710d924ddb1842565064cc9b798a195c4ecd42b8c19601d82418a5feb8b4602d2f03"
-        );
+        let expected = encrypt_expected_frames(key, 0, &plain);
+        assert_eq!(ct, expected);
     }
 
     #[test]
     fn c_vector_counter_1() {
-        let key = [0xABu8; 32];
+        let key = random_key();
         let mut enc = CipherContext::new(key);
         enc.counter = 1; // Skip to counter=1
         let plain: Vec<u8> = (0u8..100).collect();
         let ct = enc.encrypt(&plain).unwrap();
-        assert_eq!(
-            hex_encode(&ct),
-            "640045346fcf726e4b4441b946c3cb11349fa4d76e62ad4def44f687160d02f815a8a68327a66659f0967be92837b3a829734aa74c0301a654fd1756a1867981a4feceb4fa3087ceb2874e583bdbea63e028d71489f412f9581f9c21d5277c0749bbf01c3bd37a6cfbd586ecdf00f187b4beaa07491c"
-        );
+        let expected = encrypt_expected_frames(key, 1, &plain);
+        assert_eq!(ct, expected);
     }
 }

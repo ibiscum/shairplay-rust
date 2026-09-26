@@ -1893,12 +1893,13 @@ mod tests {
     async fn setup_initial_sets_video_eiv_into_connection_and_shared_state() {
         let mut conn = test_connection();
         let mut dict = plist::Dictionary::new();
-        dict.insert("eiv".into(), plist::Value::Data(vec![0xAB; 16]));
+        let eiv = rand::random::<[u8; 16]>();
+        dict.insert("eiv".into(), plist::Value::Data(eiv.to_vec()));
 
         let _resp = setup_initial(&mut conn, &dict).expect("setup_initial should succeed");
 
-        assert_eq!(conn.eiv, Some([0xAB; 16]));
-        assert_eq!(*conn.shared.video_eiv.read().unwrap(), Some([0xAB; 16]));
+        assert_eq!(conn.eiv, Some(eiv));
+        assert_eq!(*conn.shared.video_eiv.read().unwrap(), Some(eiv));
     }
 
     #[tokio::test]
@@ -1916,8 +1917,8 @@ mod tests {
     #[tokio::test]
     async fn setup_stream_realtime_legacy_path_under_video_feature() {
         let mut conn = test_connection();
-        conn.ekey = Some([0x33; 16]);
-        conn.eiv = Some([0x44; 16]);
+        conn.ekey = Some(rand::random::<[u8; 16]>());
+        conn.eiv = Some(rand::random::<[u8; 16]>());
 
         let mut stream0 = plist::Dictionary::new();
         stream0.insert("sr".into(), plist::Value::Integer(44_100_i64.into()));
