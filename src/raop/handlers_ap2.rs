@@ -1071,6 +1071,125 @@ pub(crate) fn handle_flush_buffered(
 // --- AP2 POST sub-handlers ---
 
 #[cfg(feature = "ap2")]
+fn plist_number(value: &plist::Value) -> Option<f64> {
+    value
+        .as_real()
+        .or_else(|| value.as_signed_integer().map(|v| v as f64))
+        .or_else(|| value.as_unsigned_integer().map(|v| v as f64))
+}
+
+#[cfg(feature = "ap2")]
+fn volume_key_candidate(key: &str) -> bool {
+    let key_lc = key.to_ascii_lowercase();
+    if !key_lc.contains("volume") {
+        return false;
+    }
+
+    // Capability descriptors are not live volume values.
+    !key_lc.contains("capab")
+}
+
+#[cfg(feature = "ap2")]
+fn find_volume_scalar(value: &plist::Value) -> Option<f64> {
+    if let Some(dict) = value.as_dictionary() {
+        for (key, entry) in dict {
+            if volume_key_candidate(key)
+                && let Some(v) = plist_number(entry)
+            {
+                return Some(v);
+            }
+        }
+
+        // Restrict deep search to typical AP2 command payload containers.
+        for key in ["params", "value", "args", "arguments", "command", "commandParams"] {
+            let Some(entry) = dict.get(key) else {
+                continue;
+            };
+            if let Some(v) = find_volume_scalar(entry) {
+                return Some(v);
+            }
+        }
+    }
+
+    if let Some(items) = value.as_array() {
+        for item in items {
+            if let Some(v) = find_volume_scalar(item) {
+                return Some(v);
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(feature = "ap2")]
+fn command_mentions_volume(dict: &plist::Dictionary) -> bool {
+    let type_mentions_volume = dict
+        .get("type")
+        .and_then(|v| v.as_string())
+        .map(|s| s.to_ascii_lowercase().contains("volume"))
+        .unwrap_or(false);
+
+    if type_mentions_volume {
+        return true;
+    }
+
+    dict.get("params")
+        .and_then(|v| v.as_dictionary())
+        .and_then(|v| v.get("command"))
+        .and_then(|v| v.as_string())
+        .map(|s| s.to_ascii_lowercase().contains("volume"))
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "ap2")]
+fn ap2_command_volume_db(dict: &plist::Dictionary) -> Option<f32> {
+    let cmd_type = dict
+        .get("type")
+        .and_then(|v| v.as_string())
+        .unwrap_or("unknown")
+        .to_ascii_lowercase();
+
+    if cmd_type == "updatemrsupportedcommands" {
+        return None;
+    }
+
+    let mentions_volume = command_mentions_volume(dict);
+    if !mentions_volume && (cmd_type == "unknown" || cmd_type.starts_with("update")) {
+        return None;
+    }
+
+    let scalar = find_volume_scalar(&plist::Value::Dictionary(dict.clone()))?;
+
+    if !scalar.is_finite() {
+        return None;
+    }
+
+    if (-144.0..=0.0).contains(&scalar) {
+        return Some(scalar as f32);
+    }
+
+    if (0.0..=1.0).contains(&scalar) {
+        if scalar <= 0.0 {
+            return Some(-144.0);
+        }
+        let db = 20.0 * scalar.log10();
+        return Some(db.clamp(-144.0, 0.0) as f32);
+    }
+
+    if (0.0..=100.0).contains(&scalar) {
+        let linear = scalar / 100.0;
+        if linear <= 0.0 {
+            return Some(-144.0);
+        }
+        let db = 20.0 * linear.log10();
+        return Some(db.clamp(-144.0, 0.0) as f32);
+    }
+
+    None
+}
+
+#[cfg(feature = "ap2")]
 /// AP2 POST /feedback: empty response (required by protocol).
 pub(crate) fn handle_feedback(
     conn: &mut RaopConnection,
@@ -1100,7 +1219,7 @@ pub(crate) fn handle_feedback(
 #[cfg(feature = "ap2")]
 /// AP2 POST /command: forward binary plist commands to event channel.
 pub(crate) fn handle_command(
-    _conn: &mut RaopConnection,
+    conn: &mut RaopConnection,
     request: &HttpRequest,
     _response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
@@ -1113,7 +1232,10 @@ pub(crate) fn handle_command(
             .and_then(|v| v.as_string())
             .unwrap_or("unknown");
         tracing::debug!(cmd_type, "POST /command");
-        if cmd_type == "updateMRSupportedCommands" {}
+        if let Some(volume_db) = ap2_command_volume_db(dict) {
+            tracing::debug!(cmd_type, volume_db, "AP2 volume update");
+            conn.shared.handler.on_volume(volume_db);
+        }
     }
     None
 }
@@ -1150,6 +1272,11 @@ mod tests {
     use crate::raop::{AudioFormat, AudioHandler, AudioSession, MemoryPairingStore};
     use std::sync::{Arc, Mutex};
 
+    #[derive(Default)]
+    struct RecordingState {
+        volumes: Mutex<Vec<f32>>,
+    }
+
     struct NoopSession;
 
     impl AudioSession for NoopSession {
@@ -1164,7 +1291,25 @@ mod tests {
         }
     }
 
+    struct RecordingHandler {
+        state: Arc<RecordingState>,
+    }
+
+    impl AudioHandler for RecordingHandler {
+        fn audio_init(&self, _format: AudioFormat) -> Box<dyn AudioSession> {
+            Box::new(NoopSession)
+        }
+
+        fn on_volume(&self, volume: f32) {
+            self.state.volumes.lock().unwrap().push(volume);
+        }
+    }
+
     fn test_connection() -> RaopConnection {
+        test_connection_with_handler(Arc::new(NoopHandler))
+    }
+
+    fn test_connection_with_handler(handler: Arc<dyn AudioHandler>) -> RaopConnection {
         let shared = Arc::new(RaopShared {
             rsakey: Arc::new(RsaKey::from_pem(include_str!("../../airport.key")).unwrap()),
             pairing: Arc::new(Pairing::generate().unwrap()),
@@ -1172,7 +1317,7 @@ mod tests {
             password: String::new(),
             #[cfg(feature = "pipewire-auth-setup-compat")]
             pipewire_auth_setup_compat: false,
-            handler: Arc::new(NoopHandler),
+            handler,
             pairing_store: Arc::new(MemoryPairingStore::default()),
             identity_seed: [3u8; 32],
             output_sample_rate: None,
@@ -1215,6 +1360,91 @@ mod tests {
             #[cfg(feature = "hls")]
             hls_state: HlsState::new(),
         }
+    }
+
+    #[test]
+    fn handle_command_dispatches_volume_from_normalized_scalar() {
+        let state = Arc::new(RecordingState::default());
+        let handler: Arc<dyn AudioHandler> = Arc::new(RecordingHandler {
+            state: Arc::clone(&state),
+        });
+        let mut conn = test_connection_with_handler(handler);
+
+        let mut dict = plist::Dictionary::new();
+        dict.insert("type".into(), plist::Value::String("setVolume".into()));
+        dict.insert("volume".into(), plist::Value::Real(0.5));
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(dict)).unwrap();
+
+        let req = request_with_body(
+            "POST",
+            "/command",
+            &body,
+            Some("application/x-apple-binary-plist"),
+        );
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+        assert!(handle_command(&mut conn, &req, &mut resp).is_none());
+
+        let recorded = state.volumes.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert!((recorded[0] - (-6.0206)).abs() < 0.01);
+    }
+
+    #[test]
+    fn handle_command_ignores_update_supported_commands() {
+        let state = Arc::new(RecordingState::default());
+        let handler: Arc<dyn AudioHandler> = Arc::new(RecordingHandler {
+            state: Arc::clone(&state),
+        });
+        let mut conn = test_connection_with_handler(handler);
+
+        let mut dict = plist::Dictionary::new();
+        dict.insert(
+            "type".into(),
+            plist::Value::String("updateMRSupportedCommands".into()),
+        );
+        dict.insert("deviceVolumeCapabilities".into(), plist::Value::Real(1.0));
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(dict)).unwrap();
+
+        let req = request_with_body(
+            "POST",
+            "/command",
+            &body,
+            Some("application/x-apple-binary-plist"),
+        );
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+        assert!(handle_command(&mut conn, &req, &mut resp).is_none());
+
+        let recorded = state.volumes.lock().unwrap();
+        assert!(recorded.is_empty());
+    }
+
+    #[test]
+    fn handle_command_ignores_volume_capability_only_payloads() {
+        let state = Arc::new(RecordingState::default());
+        let handler: Arc<dyn AudioHandler> = Arc::new(RecordingHandler {
+            state: Arc::clone(&state),
+        });
+        let mut conn = test_connection_with_handler(handler);
+
+        let mut dict = plist::Dictionary::new();
+        dict.insert("type".into(), plist::Value::String("setState".into()));
+        dict.insert("deviceVolumeCapabilities".into(), plist::Value::Real(0.0));
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(dict)).unwrap();
+
+        let req = request_with_body(
+            "POST",
+            "/command",
+            &body,
+            Some("application/x-apple-binary-plist"),
+        );
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+        assert!(handle_command(&mut conn, &req, &mut resp).is_none());
+
+        let recorded = state.volumes.lock().unwrap();
+        assert!(recorded.is_empty());
     }
 
     fn request_with_body(method: &str, url: &str, body: &[u8], content_type: Option<&str>) -> HttpRequest {

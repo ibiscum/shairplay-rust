@@ -15,11 +15,6 @@ categories = ["multimedia::audio", "network-programming"]
 readme = "README.md"
 homepage = "https://github.com/metaneutrons/shairplay-rust"
 repository = "https://github.com/metaneutrons/shairplay-rust"
-# rust-version = "1.94"
-
-[profile.release]
-debug = true
-
 include = [
     "/src/**",
     "/examples/**",
@@ -35,6 +30,10 @@ include = [
     "/docs/**",
     "/airport.key",
 ]
+# rust-version = "1.94"
+
+[profile.release]
+debug = true
 
 [dependencies]
 # Async runtime

@@ -227,7 +227,7 @@ impl AacDecoder {
     }
 
     /// Decode a raw AAC frame (without ADTS header) to interleaved F32 PCM.
-    pub(crate) fn decode(&mut self, raw_aac: &[u8]) -> Result<Vec<u8>, String> {
+    pub(crate) fn decode(&mut self, raw_aac: &[u8]) -> Result<Vec<f32>, String> {
         use symphonia::core::packet::PacketRef;
         use symphonia::core::units::{Duration, Timestamp};
 
@@ -237,8 +237,9 @@ impl AacDecoder {
             .decoder
             .decode_ref(&packet)
             .map_err(|e| format!("AAC decode failed: {e}"))?;
+
         let mut pcm = Vec::new();
-        decoded.copy_bytes_to_vec_interleaved_as::<f32>(&mut pcm);
+        decoded.copy_to_vec_interleaved::<f32>(&mut pcm);
         Ok(pcm)
     }
 }

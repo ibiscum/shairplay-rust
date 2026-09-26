@@ -54,7 +54,7 @@ pub enum PlayoutCommand {
 }
 
 struct PlayoutState {
-    buffer: BTreeMap<u32, Vec<f32>>, // rtp_timestamp → F32 PCM samples
+    buffer: BTreeMap<u32, BufferedFrame>, // rtp_timestamp → buffered frame + diagnostics
     anchor_rtp: u32,
     anchor_local_ns: u64,
     rate: u32,
@@ -63,6 +63,379 @@ struct PlayoutState {
     stopped: bool,
     format_changed: bool,
     flush_pending: bool,
+}
+
+#[derive(Clone)]
+struct BufferedFrame {
+    samples: Vec<f32>,
+    ssrc: AudioSsrc,
+    decoder_kind: &'static str,
+    plaintext_len: usize,
+    plaintext_nonzero_bytes: usize,
+    plaintext_prefix_hex: String,
+    selected_payload_len: usize,
+    selected_payload_prefix_hex: String,
+    decoded_amp_min: f32,
+    decoded_amp_max: f32,
+    enqueue_amp_min: f32,
+    enqueue_amp_max: f32,
+}
+
+enum BufferedDecoder {
+    Aac(AacDecoder),
+    Alac(crate::codec::alac::AlacDecoder),
+}
+
+fn alac_decoder_info(sample_rate: u32, bit_depth: u8, channels: u8) -> [u8; 48] {
+    let mut info = [0u8; 48];
+    let samples_per_frame: u32 = if sample_rate >= 48_000 { 480 } else { 352 };
+    info[24..28].copy_from_slice(&samples_per_frame.to_be_bytes());
+    info[29] = bit_depth;
+    info[30] = 40; // pb
+    info[31] = 10; // mb
+    info[32] = 14; // kb
+    info[33] = channels;
+    info[34..36].copy_from_slice(&255u16.to_be_bytes());
+    info[44..48].copy_from_slice(&sample_rate.to_be_bytes());
+    info
+}
+
+fn make_decoder(ssrc: AudioSsrc, src_sr: u32, src_ch: u8) -> Option<BufferedDecoder> {
+    if ssrc.is_alac() {
+        let bit_depth = ssrc.bit_depth().unwrap_or(16);
+        let mut dec = crate::codec::alac::AlacDecoder::new(bit_depth as i32, src_ch as i32);
+        let info = alac_decoder_info(src_sr, bit_depth, src_ch);
+        dec.set_info(&info);
+        return Some(BufferedDecoder::Alac(dec));
+    }
+
+    AacDecoder::new(src_sr, src_ch).ok().map(BufferedDecoder::Aac)
+}
+
+fn amplitude_min_max(samples: &[f32]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for &v in samples {
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
+    }
+    (min, max)
+}
+
+fn extract_aac_access_unit(payload: &[u8]) -> Option<&[u8]> {
+    // AP2 buffered AAC frames may carry an RFC3640-style AU header section:
+    // [AU-headers-length:16b][AU-header...][AAC access unit bytes...].
+    // If present, strip it so ADTS wrapping sees a clean AAC frame.
+    if payload.len() < 4 {
+        return None;
+    }
+
+    let au_headers_bits = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+    // RFC3640 AU header section must be byte-aligned and reasonably small.
+    if au_headers_bits == 0 || !au_headers_bits.is_multiple_of(8) || au_headers_bits > 128 {
+        return None;
+    }
+
+    let au_headers_bytes = au_headers_bits / 8;
+    let data_start = 2 + au_headers_bytes;
+    if data_start >= payload.len() {
+        return None;
+    }
+
+    // First AU-header for AAC-hbr is commonly 16 bits: size(13) + index(3).
+    if au_headers_bits >= 16 && payload.len() >= 4 {
+        let first_au_header = u16::from_be_bytes([payload[2], payload[3]]);
+        let au_size_bits = (first_au_header >> 3) as usize;
+        if au_size_bits == 0 {
+            return None;
+        }
+
+        let au_size_bytes = au_size_bits.div_ceil(8);
+        let available = payload.len() - data_start;
+        if au_size_bytes <= available {
+            return Some(&payload[data_start..data_start + au_size_bytes]);
+        }
+        return None;
+    }
+
+    let au = &payload[data_start..];
+    if au.len() >= 8 {
+        Some(au)
+    } else {
+        None
+    }
+}
+
+fn extract_aac_access_unit_direct_header(payload: &[u8]) -> Option<&[u8]> {
+    // Some AP2 senders appear to omit the RFC3640 AU-headers-length field and
+    // start directly with one 16-bit AU header: size(13) + index(3).
+    if payload.len() < 3 {
+        return None;
+    }
+
+    let au_header = u16::from_be_bytes([payload[0], payload[1]]);
+    let au_size_bits = (au_header >> 3) as usize;
+    if au_size_bits == 0 {
+        return None;
+    }
+
+    let au_size_bytes = au_size_bits.div_ceil(8);
+    if au_size_bytes > payload.len().saturating_sub(2) {
+        return None;
+    }
+
+    let au = &payload[2..2 + au_size_bytes];
+    if au.len() >= 8 {
+        Some(au)
+    } else {
+        None
+    }
+}
+
+fn starts_with_adts_sync(payload: &[u8]) -> bool {
+    payload.len() >= 2 && payload[0] == 0xFF && (payload[1] & 0xF0) == 0xF0
+}
+
+fn extract_aac_access_unit_shifted(payload: &[u8]) -> Option<(&[u8], &'static str)> {
+    // Some senders prepend small side headers ahead of RFC3640 AU headers.
+    // Try a small offset window and accept the first plausible AU section.
+    for offset in 0..=16 {
+        if payload.len() < offset + 4 {
+            continue;
+        }
+        let view = &payload[offset..];
+        let Some(au) = extract_aac_access_unit(view) else {
+            continue;
+        };
+        if au.len() < view.len() {
+            let label = match offset {
+                0 => "aac-au",
+                1 => "aac-au+1",
+                2 => "aac-au+2",
+                3 => "aac-au+3",
+                4 => "aac-au+4",
+                5 => "aac-au+5",
+                6 => "aac-au+6",
+                7 => "aac-au+7",
+                8 => "aac-au+8",
+                9 => "aac-au+9",
+                10 => "aac-au+10",
+                11 => "aac-au+11",
+                12 => "aac-au+12",
+                13 => "aac-au+13",
+                14 => "aac-au+14",
+                15 => "aac-au+15",
+                _ => "aac-au+16",
+            };
+            return Some((au, label));
+        }
+    }
+    None
+}
+
+fn aac_au_label_for_offset(offset: usize) -> &'static str {
+    match offset {
+        0 => "aac-au",
+        1 => "aac-au+1",
+        2 => "aac-au+2",
+        3 => "aac-au+3",
+        4 => "aac-au+4",
+        5 => "aac-au+5",
+        6 => "aac-au+6",
+        7 => "aac-au+7",
+        8 => "aac-au+8",
+        9 => "aac-au+9",
+        10 => "aac-au+10",
+        11 => "aac-au+11",
+        12 => "aac-au+12",
+        13 => "aac-au+13",
+        14 => "aac-au+14",
+        15 => "aac-au+15",
+        _ => "aac-au+16",
+    }
+}
+
+fn aac_au_direct_label_for_offset(offset: usize) -> &'static str {
+    match offset {
+        0 => "aac-au-direct",
+        1 => "aac-au-direct+1",
+        2 => "aac-au-direct+2",
+        3 => "aac-au-direct+3",
+        4 => "aac-au-direct+4",
+        5 => "aac-au-direct+5",
+        6 => "aac-au-direct+6",
+        7 => "aac-au-direct+7",
+        8 => "aac-au-direct+8",
+        9 => "aac-au-direct+9",
+        10 => "aac-au-direct+10",
+        11 => "aac-au-direct+11",
+        12 => "aac-au-direct+12",
+        13 => "aac-au-direct+13",
+        14 => "aac-au-direct+14",
+        15 => "aac-au-direct+15",
+        _ => "aac-au-direct+16",
+    }
+}
+
+fn collect_aac_payload_candidates<'a>(payload: &'a [u8]) -> Vec<(&'a [u8], &'static str)> {
+    let mut candidates: Vec<(&'a [u8], &'static str)> = Vec::new();
+
+    // Keep ordering deterministic so logs remain stable between runs.
+    if starts_with_adts_sync(payload) && payload.len() > 7 {
+        candidates.push((&payload[7..], "aac-adts"));
+    }
+    if payload.len() > 11 && starts_with_adts_sync(&payload[4..]) {
+        candidates.push((&payload[11..], "aac-adts+4"));
+    }
+
+    for offset in 0..=16 {
+        if payload.len() < offset + 4 {
+            continue;
+        }
+        let view = &payload[offset..];
+        if let Some(au) = extract_aac_access_unit(view) {
+            candidates.push((au, aac_au_label_for_offset(offset)));
+        }
+        if let Some(au) = extract_aac_access_unit_direct_header(view) {
+            candidates.push((au, aac_au_direct_label_for_offset(offset)));
+        }
+    }
+
+    candidates.push((payload, "aac"));
+
+    // De-duplicate equivalent payload slices to avoid redundant decode attempts.
+    let mut unique: Vec<(&'a [u8], &'static str)> = Vec::with_capacity(candidates.len());
+    for (slice, label) in candidates {
+        if slice.len() < 8 {
+            continue;
+        }
+        if unique.iter().any(|(seen, _)| *seen == slice) {
+            continue;
+        }
+        unique.push((slice, label));
+    }
+
+    unique
+}
+
+fn samples_peak_abs(samples: &[f32]) -> f32 {
+    samples
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0f32, |acc, v| if v > acc { v } else { acc })
+}
+
+fn decode_aac_best_candidate(
+    payload: &[u8],
+    sample_rate: u32,
+    channels: u8,
+) -> Option<(Vec<f32>, &'static str, usize, String)> {
+    let candidates = collect_aac_payload_candidates(payload);
+    let mut best_non_silent: Option<(Vec<f32>, &'static str, usize, String, f32)> = None;
+    let mut best_any: Option<(Vec<f32>, &'static str, usize, String, f32)> = None;
+
+    for (candidate, label) in candidates {
+        let Ok(mut probe_decoder) = AacDecoder::new(sample_rate, channels) else {
+            break;
+        };
+
+        let Ok(samples) = probe_decoder.decode(candidate) else {
+            continue;
+        };
+
+        if samples.is_empty() {
+            continue;
+        }
+
+        let peak = samples_peak_abs(&samples);
+        let record = (
+            samples,
+            label,
+            candidate.len(),
+            prefix_hex(candidate, 16),
+            peak,
+        );
+
+        if peak > 1.0e-7 {
+            if best_non_silent
+                .as_ref()
+                .map(|(_, _, _, _, best_peak)| peak > *best_peak)
+                .unwrap_or(true)
+            {
+                best_non_silent = Some(record);
+            }
+        } else if best_any
+            .as_ref()
+            .map(|(_, _, _, _, best_peak)| peak > *best_peak)
+            .unwrap_or(true)
+        {
+            best_any = Some(record);
+        }
+    }
+
+    best_non_silent
+        .or(best_any)
+        .map(|(samples, kind, payload_len, payload_prefix, _)| {
+            (samples, kind, payload_len, payload_prefix)
+        })
+}
+
+fn prefix_hex(payload: &[u8], max_len: usize) -> String {
+    payload
+        .iter()
+        .take(max_len)
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<String>>()
+        .join("")
+}
+
+fn select_aac_payload<'a>(payload: &'a [u8]) -> (&'a [u8], &'static str) {
+    // If payload already carries an ADTS frame, strip header and keep AAC raw data.
+    if starts_with_adts_sync(payload) && payload.len() > 7 {
+        return (&payload[7..], "aac-adts");
+    }
+
+    if payload.len() > 11 && starts_with_adts_sync(&payload[4..]) {
+        return (&payload[11..], "aac-adts+4");
+    }
+
+    if let Some((au, label)) = extract_aac_access_unit_shifted(payload) {
+        return (au, label);
+    }
+
+    if let Some(au) = extract_aac_access_unit_direct_header(payload) {
+        return (au, "aac-au-direct");
+    }
+
+    (payload, "aac")
+}
+
+#[cfg(test)]
+fn make_buffered_frame(samples: Vec<f32>) -> BufferedFrame {
+    let (decoded_amp_min, decoded_amp_max) = amplitude_min_max(&samples);
+    let (enqueue_amp_min, enqueue_amp_max) = amplitude_min_max(&samples);
+    BufferedFrame {
+        samples,
+        ssrc: AudioSsrc::None,
+        decoder_kind: "test",
+        plaintext_len: 0,
+        plaintext_nonzero_bytes: 0,
+        plaintext_prefix_hex: String::new(),
+        selected_payload_len: 0,
+        selected_payload_prefix_hex: String::new(),
+        decoded_amp_min,
+        decoded_amp_max,
+        enqueue_amp_min,
+        enqueue_amp_max,
+    }
 }
 
 fn apply_playout_command(
@@ -221,7 +594,7 @@ async fn receive_loop(
 
     let cipher = ChaCha20Poly1305::new(shk.into());
     let mut len_buf = [0u8; 2];
-    let mut decoder: Option<AacDecoder> = None;
+    let mut decoder: Option<BufferedDecoder> = None;
     let mut current_ssrc = AudioSsrc::None;
     let mut stream_resampler: Option<crate::codec::resample::StreamResampler> = None;
     let mut source_channels: u8 = 2;
@@ -255,11 +628,11 @@ async fn receive_loop(
             let src_ch = ssrc.channels();
             info!(ssrc = ?ssrc, src_sr, src_ch, "Audio format detected");
 
-            decoder = AacDecoder::new(src_sr, src_ch).ok();
+            decoder = make_decoder(ssrc, src_sr, src_ch);
             if decoder.is_none() {
-                warn!("Failed to create AAC decoder for {:?}", ssrc);
+                warn!("Failed to create decoder for {:?}", ssrc);
                 handler.on_error(&ShairplayError::Codec(CodecError::UnsupportedFormat(format!(
-                    "AAC decoder init failed (ssrc={ssrc:?}, sample_rate={src_sr}, channels={src_ch})"
+                    "decoder init failed (ssrc={ssrc:?}, sample_rate={src_sr}, channels={src_ch})"
                 ))));
             }
 
@@ -293,28 +666,61 @@ async fn receive_loop(
             continue;
         };
 
-        // Decode raw AAC payload by ADTS-framing it in the decoder.
-        let pcm = if let Some(dec) = &mut decoder {
-            match dec.decode(&plaintext) {
-                Ok(pcm) => Some(pcm),
-                Err(e) => {
-                    debug!(error = %e, ssrc = ?current_ssrc, "AAC decode failed");
-                    None
+        let (samples, decoder_kind, selected_payload_len, selected_payload_prefix_hex) = if let Some(dec) = &mut decoder {
+            match dec {
+                BufferedDecoder::Aac(dec) => {
+                    let probe = decode_aac_best_candidate(
+                        &plaintext,
+                        current_ssrc.sample_rate(),
+                        current_ssrc.channels(),
+                    );
+
+                    if let Some((samples, payload_kind, payload_len, payload_prefix)) = probe {
+                        Some((samples, payload_kind, payload_len, payload_prefix))
+                    } else {
+                        let (aac_payload, payload_kind) = select_aac_payload(&plaintext);
+                        let payload_len = aac_payload.len();
+                        let payload_prefix = prefix_hex(aac_payload, 16);
+                        match dec.decode(aac_payload) {
+                            Ok(samples) => Some(
+                                (
+                                    samples,
+                                    payload_kind,
+                                    payload_len,
+                                    payload_prefix,
+                                ),
+                            ),
+                            Err(e) => {
+                                debug!(error = %e, ssrc = ?current_ssrc, payload_kind, "AAC decode failed");
+                                None
+                            }
+                        }
+                    }
+                }
+                BufferedDecoder::Alac(dec) => {
+                    let decoded = dec.decode_frame_f32(&plaintext);
+                    if decoded.is_none() {
+                        debug!(ssrc = ?current_ssrc, "ALAC decode failed");
+                    }
+                    decoded.map(|samples| {
+                        (
+                            samples,
+                            "alac",
+                            plaintext.len(),
+                            prefix_hex(&plaintext, 16),
+                        )
+                    })
                 }
             }
         } else {
             None
-        };
+        }
+        .map_or((None, "none", 0usize, String::new()), |(samples, kind, payload_len, payload_prefix)| {
+            (Some(samples), kind, payload_len, payload_prefix)
+        });
 
-        if let Some(pcm_data) = pcm {
-            // Convert bytes to f32 samples for processing
-            let samples: Vec<f32> = pcm_data
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-
+        if let Some(samples) = samples {
+            let (decoded_amp_min, decoded_amp_max) = amplitude_min_max(&samples);
             // Mix down + resample to the output format.
             let samples = crate::codec::resample::mixdown_and_resample(
                 samples,
@@ -323,9 +729,28 @@ async fn receive_loop(
                 &mut stream_resampler,
             );
 
+            let (enqueue_amp_min, enqueue_amp_max) = amplitude_min_max(&samples);
+
             let (lock, cvar) = &*state;
             let mut s = lock.lock().unwrap();
-            s.buffer.insert(timestamp, samples);
+            let plaintext_nonzero_bytes = plaintext.iter().filter(|&&b| b != 0).count();
+            s.buffer.insert(
+                timestamp,
+                BufferedFrame {
+                    samples,
+                    ssrc: current_ssrc,
+                    decoder_kind,
+                    plaintext_len: plaintext.len(),
+                    plaintext_nonzero_bytes,
+                    plaintext_prefix_hex: prefix_hex(&plaintext, 16),
+                    selected_payload_len,
+                    selected_payload_prefix_hex,
+                    decoded_amp_min,
+                    decoded_amp_max,
+                    enqueue_amp_min,
+                    enqueue_amp_max,
+                },
+            );
             cvar.notify_all();
         }
     }
@@ -378,11 +803,11 @@ fn delivery_loop(
         let elapsed_frames = (elapsed_ns as u128 * s.sample_rate as u128 / 1_000_000_000) as u32;
         let target_rtp = s.anchor_rtp.wrapping_add(elapsed_frames);
 
-        let ready: Vec<(u32, Vec<f32>)> = s
+        let ready: Vec<(u32, BufferedFrame)> = s
             .buffer
             .iter()
             .filter(|(ts, _)| (target_rtp.wrapping_sub(**ts) as i32) >= 0)
-            .map(|(&ts, data)| (ts, data.clone()))
+            .map(|(&ts, frame)| (ts, frame.clone()))
             .collect();
 
         for (ts, _) in &ready {
@@ -394,8 +819,27 @@ fn delivery_loop(
             if do_flush {
                 sess.audio_flush();
             }
-            for (_, frame) in &ready {
-                sess.audio_process(frame);
+            for (timestamp, frame) in &ready {
+                let (process_amp_min, process_amp_max) = amplitude_min_max(&frame.samples);
+                debug!(
+                    timestamp,
+                    ssrc = ?frame.ssrc,
+                    decoder_kind = frame.decoder_kind,
+                    sample_count = frame.samples.len(),
+                    plaintext_len = frame.plaintext_len,
+                    plaintext_nonzero_bytes = frame.plaintext_nonzero_bytes,
+                    plaintext_prefix_hex = frame.plaintext_prefix_hex,
+                    selected_payload_len = frame.selected_payload_len,
+                    selected_payload_prefix_hex = frame.selected_payload_prefix_hex,
+                    decoded_amp_min = frame.decoded_amp_min,
+                    decoded_amp_max = frame.decoded_amp_max,
+                    enqueue_amp_min = frame.enqueue_amp_min,
+                    enqueue_amp_max = frame.enqueue_amp_max,
+                    process_amp_min,
+                    process_amp_max,
+                    "AP2 buffered frame amplitudes decode/enqueue/process"
+                );
+                sess.audio_process(&frame.samples);
             }
         }
 
@@ -461,8 +905,8 @@ mod tests {
     #[test]
     fn apply_playout_command_set_rate_sets_anchor_and_discards_stale() {
         let mut s = fresh_state();
-        s.buffer.insert(10_000, vec![0.1; 4]);
-        s.buffer.insert(20_000, vec![0.2; 4]);
+        s.buffer.insert(10_000, make_buffered_frame(vec![0.1; 4]));
+        s.buffer.insert(20_000, make_buffered_frame(vec![0.2; 4]));
 
         let keep = apply_playout_command(
             &mut s,
@@ -486,9 +930,9 @@ mod tests {
     #[test]
     fn apply_playout_command_flush_and_stop_paths() {
         let mut s = fresh_state();
-        s.buffer.insert(100, vec![0.1]);
-        s.buffer.insert(200, vec![0.2]);
-        s.buffer.insert(300, vec![0.3]);
+        s.buffer.insert(100, make_buffered_frame(vec![0.1]));
+        s.buffer.insert(200, make_buffered_frame(vec![0.2]));
+        s.buffer.insert(300, make_buffered_frame(vec![0.3]));
 
         let keep = apply_playout_command(
             &mut s,
@@ -532,8 +976,8 @@ mod tests {
             s.anchor_rtp = 0;
             s.anchor_local_ns = now_ns().saturating_sub(2_000_000_000);
             s.flush_pending = true;
-            s.buffer.insert(1, vec![0.1, 0.2]);
-            s.buffer.insert(2, vec![0.3, 0.4]);
+            s.buffer.insert(1, make_buffered_frame(vec![0.1, 0.2]));
+            s.buffer.insert(2, make_buffered_frame(vec![0.3, 0.4]));
         }
 
         let state2 = Arc::clone(&state);
