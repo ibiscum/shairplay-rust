@@ -78,10 +78,13 @@ impl VideoCipher {
 mod tests {
     use super::*;
 
+    fn random_key_iv() -> ([u8; 16], [u8; 16]) {
+        (rand::random::<[u8; 16]>(), rand::random::<[u8; 16]>())
+    }
+
     #[test]
     fn decrypt_full_blocks() {
-        let key = [0x01u8; 16];
-        let iv = [0x00u8; 16];
+        let (key, iv) = random_key_iv();
         let mut cipher1 = VideoCipher::new(&key, &iv);
         let mut cipher2 = VideoCipher::new(&key, &iv);
 
@@ -96,8 +99,7 @@ mod tests {
 
     #[test]
     fn decrypt_partial_blocks_streaming() {
-        let key = [0x42u8; 16];
-        let iv = [0x00u8; 16];
+        let (key, iv) = random_key_iv();
 
         // Single cipher, two chunks that don't align to 16 bytes
         let mut cipher_a = VideoCipher::new(&key, &iv);
@@ -118,8 +120,7 @@ mod tests {
 
     #[test]
     fn decrypt_tiny_chunks_matches_single_pass() {
-        let key = [0x21u8; 16];
-        let iv = [0x10u8; 16];
+        let (key, iv) = random_key_iv();
 
         // Build deterministic input and process it in many tiny chunks to hit
         // repeated "apply < leftover" paths.
@@ -146,8 +147,7 @@ mod tests {
 
     #[test]
     fn decrypt_empty_payload_keeps_state() {
-        let key = [0xABu8; 16];
-        let iv = [0xCDu8; 16];
+        let (key, iv) = random_key_iv();
         let mut cipher = VideoCipher::new(&key, &iv);
 
         // Seed leftover state with a partial block.
