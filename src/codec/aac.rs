@@ -2,6 +2,7 @@
 //!
 //! Raw AAC packets from the buffered audio stream need ADTS headers
 //! prepended before they can be decoded. Ported from ap2_buffered_audio_processor.c.
+//! The current runtime path is AAC-LC (matching AP2 stream usage today).
 
 /// SSRC values identifying the audio format (from shairport-sync player.h).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,49 +162,35 @@ pub(crate) fn wrap_adts(raw_aac: &[u8], rate: u32, channels: u8) -> Result<Vec<u
     Ok(out)
 }
 
-/// Persistent AAC decoder using symphonia. Decodes raw AAC by first ADTS-framing it.
+/// Persistent AAC-LC decoder using fdk-aac-rust. Decodes raw AAC by first ADTS-framing it.
 pub(crate) struct AacDecoder {
-    decoder: Box<dyn symphonia::core::codecs::audio::AudioDecoder>,
-    sample_rate: u32,
+    decoder: fdk_aac_rust::decoder::AacLcDecoder,
     adts_channel_config: u8,
+    sample_rate: u32,
+}
+
+fn adts_freq_index(rate: u32) -> Result<u8, String> {
+    match rate {
+        96000 => Ok(0),
+        88200 => Ok(1),
+        64000 => Ok(2),
+        48000 => Ok(3),
+        44100 => Ok(4),
+        32000 => Ok(5),
+        24000 => Ok(6),
+        22050 => Ok(7),
+        16000 => Ok(8),
+        12000 => Ok(9),
+        11025 => Ok(10),
+        8000 => Ok(11),
+        7350 => Ok(12),
+        _ => Err(format!("Unsupported ADTS sample rate: {} Hz", rate)),
+    }
 }
 
 impl AacDecoder {
     /// Create a new decoder for the given format.
     pub(crate) fn new(sample_rate: u32, channels: u8) -> Result<Self, String> {
-        use symphonia::core::audio::{Channels, Position};
-        use symphonia::core::codecs::audio::{
-            AudioCodecParameters, AudioDecoderOptions, well_known::CODEC_ID_AAC,
-        };
-
-        let mut params = AudioCodecParameters::new();
-        params.for_codec(CODEC_ID_AAC).with_sample_rate(sample_rate);
-
-        let ch = match channels {
-            1 => Channels::Positioned(Position::FRONT_CENTER),
-            2 => Channels::Positioned(Position::FRONT_LEFT | Position::FRONT_RIGHT),
-            6 => Channels::Positioned(
-                Position::FRONT_LEFT
-                    | Position::FRONT_RIGHT
-                    | Position::FRONT_CENTER
-                    | Position::REAR_LEFT
-                    | Position::REAR_RIGHT
-                    | Position::LFE1,
-            ),
-            8 => Channels::Positioned(
-                Position::FRONT_LEFT
-                    | Position::FRONT_RIGHT
-                    | Position::FRONT_CENTER
-                    | Position::SIDE_LEFT
-                    | Position::SIDE_RIGHT
-                    | Position::REAR_LEFT
-                    | Position::REAR_RIGHT
-                    | Position::LFE1,
-            ),
-            _ => Channels::Positioned(Position::FRONT_LEFT | Position::FRONT_RIGHT),
-        };
-        params.with_channels(ch);
-
         let adts_channel_config = match channels {
             1..=7 => channels,
             8 => 7, // ADTS channel config 7 corresponds to 7.1.
@@ -215,31 +202,30 @@ impl AacDecoder {
             }
         };
 
-        let decoder = symphonia::default::get_codecs()
-            .make_audio_decoder(&params, &AudioDecoderOptions::default())
+        let sampling_frequency_index = adts_freq_index(sample_rate)?;
+        let decoder = fdk_aac_rust::decoder::AacLcDecoder::new(
+            sampling_frequency_index,
+            adts_channel_config,
+        )
             .map_err(|e| format!("AAC decoder init failed: {e}"))?;
 
         Ok(Self {
             decoder,
-            sample_rate,
             adts_channel_config,
+            sample_rate,
         })
     }
 
     /// Decode a raw AAC frame (without ADTS header) to interleaved F32 PCM.
     pub(crate) fn decode(&mut self, raw_aac: &[u8]) -> Result<Vec<f32>, String> {
-        use symphonia::core::packet::PacketRef;
-        use symphonia::core::units::{Duration, Timestamp};
-
         let framed = wrap_adts(raw_aac, self.sample_rate, self.adts_channel_config)?;
-        let packet = PacketRef::new(0, Timestamp::new(0), Duration::new(1024), &framed);
-        let decoded = self
+        let pcm_i16 = self
             .decoder
-            .decode_ref(&packet)
+            .decode_adts_frame_fixed_interleaved_i16(&framed)
             .map_err(|e| format!("AAC decode failed: {e}"))?;
 
-        let mut pcm = Vec::new();
-        decoded.copy_to_vec_interleaved::<f32>(&mut pcm);
+        let mut pcm = Vec::with_capacity(pcm_i16.len());
+        pcm.extend(pcm_i16.iter().map(|&s| f32::from(s) / 32768.0));
         Ok(pcm)
     }
 }

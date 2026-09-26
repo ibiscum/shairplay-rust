@@ -171,7 +171,7 @@ limits and requirements for conformant receiver authentication.
 | `diagnostic-headers` | none | Opt-in, redacted RTSP request and response header diagnostics |
 | `dangerous-raw-headers` | (implies `diagnostic-headers`) | Raw header values for explicit use in debug-assertion builds |
 | `resample` | rubato | Sample rate conversion + channel mixdown |
-| `ap2` | chacha20poly1305, hkdf, symphonia, … (implies `resample`) | Full AirPlay 2 audio |
+| `ap2` | chacha20poly1305, hkdf, fdk-aac-rust, … (implies `resample`) | Full AirPlay 2 audio |
 | `video` | (implies `ap2`) | Legacy feature set for screen mirroring (`0x527FFEE6`) |
 | `hls` | (implies `video`) | HLS video playback (YouTube, etc.) — receiver relays URL to app |
 
@@ -241,6 +241,12 @@ Rock solid. ALAC and raw L16 PCM decoding, optional AES encryption, DACP remote 
 ### ✅ AirPlay 2 Audio — Production Ready
 
 Full pipeline: SRP-6a pairing → encrypted RTSP → FairPlay → PTP timing → buffered AAC decode → f32 PCM output. Multichannel 5.1/7.1 with ITU-R BS.775 mixdown. Automatic resampling. Both stream types implemented:
+
+AAC backend note: AP2 buffered audio currently decodes AAC-LC access units, but
+the decoder stack was moved to `fdk-aac-rust` because it exposes explicit
+AAC-profile-aware decoder APIs and transport-level controls (ADTS/ASC), which
+makes profile handling deterministic and gives a direct path to additional AAC
+profiles without another backend swap.
 
 - **Type 103 (buffered)** — AAC over TCP with timed playout buffer. Used for music.
 - **Type 96 (realtime)** — ALAC over UDP with immediate delivery. Used for Siri, phone calls, system sounds.
@@ -323,7 +329,7 @@ src/
 │   └── tlv              AP2 TLV codec for pairing messages
 ├── codec/               Audio decoders
 │   ├── alac             ALAC decoder (AP1)
-│   ├── aac              AAC decoder via symphonia (AP2)
+│   ├── aac              AAC decoder via fdk-aac-rust (AP2)
 │   └── resample         Sample rate conversion + channel mixdown
 ├── proto/               SDP, HTTP/RTSP, binary plist, HTTP Digest auth
 ├── net/                 Async TCP server, mDNS, PTP timing, feature flags

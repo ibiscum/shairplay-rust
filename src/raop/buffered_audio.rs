@@ -1,7 +1,7 @@
 //! AirPlay 2 buffered audio processor (stream type 103).
 //!
 //! Receives encrypted AAC packets over TCP, decrypts with ChaCha20-Poly1305,
-//! decodes via symphonia, resamples/mixes down, and delivers F32LE PCM through
+//! decodes via fdk-aac-rust, resamples/mixes down, and delivers F32LE PCM through
 //! a timed playout buffer.
 //!
 //! Three concurrent tasks:

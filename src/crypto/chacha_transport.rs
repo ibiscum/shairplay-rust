@@ -181,17 +181,7 @@ impl EncryptedChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::RngCore;
 
-    fn random_key() -> [u8; 32] {
-        rand::random::<[u8; 32]>()
-    }
-
-    fn random_secret() -> [u8; 64] {
-        let mut secret = [0u8; 64];
-        rand::thread_rng().fill_bytes(&mut secret);
-        secret
-    }
 
     fn encrypt_expected_frame(key: [u8; 32], counter: u64, plain: &[u8]) -> Vec<u8> {
         let cipher = ChaCha20Poly1305::new((&key).into());
