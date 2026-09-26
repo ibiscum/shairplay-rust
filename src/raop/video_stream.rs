@@ -137,6 +137,7 @@ async fn process(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::RngCore;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -188,6 +189,15 @@ mod tests {
         (server, client)
     }
 
+    fn random_key_iv() -> ([u8; 16], [u8; 16]) {
+        let mut key = [0u8; 16];
+        let mut iv = [0u8; 16];
+        let mut rng = rand::thread_rng();
+        rng.fill_bytes(&mut key);
+        rng.fill_bytes(&mut iv);
+        (key, iv)
+    }
+
     #[test]
     fn parses_little_endian_header_fields() {
         let mut header = [0u8; VIDEO_HEADER_LEN];
@@ -227,8 +237,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_decrypts_payload_skips_empty_and_ends_on_oversized_payload() {
-        let key = [0x11u8; 16];
-        let iv = [0x22u8; 16];
+        let (key, iv) = random_key_iv();
 
         let (server, mut client) = connected_tcp_pair().await;
 
@@ -285,8 +294,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_accepts_expected_peer_and_processes_stream() {
-        let key = [0x33u8; 16];
-        let iv = [0x44u8; 16];
+        let (key, iv) = random_key_iv();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 

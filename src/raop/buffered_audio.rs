@@ -79,6 +79,10 @@ struct BufferedFrame {
     decoded_amp_max: f32,
     enqueue_amp_min: f32,
     enqueue_amp_max: f32,
+    aac_candidate_count: usize,
+    aac_decoded_count: usize,
+    aac_non_silent_count: usize,
+    aac_best_peak: f32,
 }
 
 enum BufferedDecoder {
@@ -285,6 +289,44 @@ fn aac_au_direct_label_for_offset(offset: usize) -> &'static str {
     }
 }
 
+fn aac_raw_label_for_offset(offset: usize) -> &'static str {
+    match offset {
+        0 => "aac",
+        1 => "aac+1",
+        2 => "aac+2",
+        3 => "aac+3",
+        4 => "aac+4",
+        5 => "aac+5",
+        6 => "aac+6",
+        7 => "aac+7",
+        8 => "aac+8",
+        9 => "aac+9",
+        10 => "aac+10",
+        11 => "aac+11",
+        12 => "aac+12",
+        13 => "aac+13",
+        14 => "aac+14",
+        15 => "aac+15",
+        16 => "aac+16",
+        17 => "aac+17",
+        18 => "aac+18",
+        19 => "aac+19",
+        20 => "aac+20",
+        21 => "aac+21",
+        22 => "aac+22",
+        23 => "aac+23",
+        24 => "aac+24",
+        25 => "aac+25",
+        26 => "aac+26",
+        27 => "aac+27",
+        28 => "aac+28",
+        29 => "aac+29",
+        30 => "aac+30",
+        31 => "aac+31",
+        _ => "aac+32",
+    }
+}
+
 fn collect_aac_payload_candidates<'a>(payload: &'a [u8]) -> Vec<(&'a [u8], &'static str)> {
     let mut candidates: Vec<(&'a [u8], &'static str)> = Vec::new();
 
@@ -309,7 +351,12 @@ fn collect_aac_payload_candidates<'a>(payload: &'a [u8]) -> Vec<(&'a [u8], &'sta
         }
     }
 
-    candidates.push((payload, "aac"));
+    for offset in 0..=32 {
+        if payload.len() <= offset + 8 {
+            continue;
+        }
+        candidates.push((&payload[offset..], aac_raw_label_for_offset(offset)));
+    }
 
     // De-duplicate equivalent payload slices to avoid redundant decode attempts.
     let mut unique: Vec<(&'a [u8], &'static str)> = Vec::with_capacity(candidates.len());
@@ -333,14 +380,26 @@ fn samples_peak_abs(samples: &[f32]) -> f32 {
         .fold(0.0f32, |acc, v| if v > acc { v } else { acc })
 }
 
-fn decode_aac_best_candidate(
-    payload: &[u8],
+struct AacProbeOutcome<'a> {
+    chosen: Option<(&'a [u8], &'static str, usize, String, f32)>,
+    candidate_count: usize,
+    decoded_count: usize,
+    non_silent_count: usize,
+    best_peak: f32,
+}
+
+fn probe_aac_candidates<'a>(
+    payload: &'a [u8],
     sample_rate: u32,
     channels: u8,
-) -> Option<(Vec<f32>, &'static str, usize, String)> {
+) -> AacProbeOutcome<'a> {
     let candidates = collect_aac_payload_candidates(payload);
-    let mut best_non_silent: Option<(Vec<f32>, &'static str, usize, String, f32)> = None;
-    let mut best_any: Option<(Vec<f32>, &'static str, usize, String, f32)> = None;
+    let candidate_count = candidates.len();
+    let mut best_non_silent: Option<(&'a [u8], &'static str, usize, String, f32)> = None;
+    let mut best_any: Option<(&'a [u8], &'static str, usize, String, f32)> = None;
+    let mut decoded_count = 0usize;
+    let mut non_silent_count = 0usize;
+    let mut best_peak = 0.0f32;
 
     for (candidate, label) in candidates {
         let Ok(mut probe_decoder) = AacDecoder::new(sample_rate, channels) else {
@@ -350,14 +409,18 @@ fn decode_aac_best_candidate(
         let Ok(samples) = probe_decoder.decode(candidate) else {
             continue;
         };
+        decoded_count += 1;
 
         if samples.is_empty() {
             continue;
         }
 
         let peak = samples_peak_abs(&samples);
+        if peak > best_peak {
+            best_peak = peak;
+        }
         let record = (
-            samples,
+            candidate,
             label,
             candidate.len(),
             prefix_hex(candidate, 16),
@@ -365,6 +428,7 @@ fn decode_aac_best_candidate(
         );
 
         if peak > 1.0e-7 {
+            non_silent_count += 1;
             if best_non_silent
                 .as_ref()
                 .map(|(_, _, _, _, best_peak)| peak > *best_peak)
@@ -381,11 +445,13 @@ fn decode_aac_best_candidate(
         }
     }
 
-    best_non_silent
-        .or(best_any)
-        .map(|(samples, kind, payload_len, payload_prefix, _)| {
-            (samples, kind, payload_len, payload_prefix)
-        })
+    AacProbeOutcome {
+        chosen: best_non_silent.or(best_any),
+        candidate_count,
+        decoded_count,
+        non_silent_count,
+        best_peak,
+    }
 }
 
 fn prefix_hex(payload: &[u8], max_len: usize) -> String {
@@ -435,6 +501,10 @@ fn make_buffered_frame(samples: Vec<f32>) -> BufferedFrame {
         decoded_amp_max,
         enqueue_amp_min,
         enqueue_amp_max,
+        aac_candidate_count: 0,
+        aac_decoded_count: 0,
+        aac_non_silent_count: 0,
+        aac_best_peak: 0.0,
     }
 }
 
@@ -666,17 +736,32 @@ async fn receive_loop(
             continue;
         };
 
-        let (samples, decoder_kind, selected_payload_len, selected_payload_prefix_hex) = if let Some(dec) = &mut decoder {
+        let (samples, decoder_kind, selected_payload_len, selected_payload_prefix_hex, aac_candidate_count, aac_decoded_count, aac_non_silent_count, aac_best_peak) = if let Some(dec) = &mut decoder {
             match dec {
                 BufferedDecoder::Aac(dec) => {
-                    let probe = decode_aac_best_candidate(
+                    let probe = probe_aac_candidates(
                         &plaintext,
                         current_ssrc.sample_rate(),
                         current_ssrc.channels(),
                     );
 
-                    if let Some((samples, payload_kind, payload_len, payload_prefix)) = probe {
-                        Some((samples, payload_kind, payload_len, payload_prefix))
+                    if let Some((samples, payload_kind, payload_len, payload_prefix, _selected_peak)) = probe.chosen {
+                        match dec.decode(samples) {
+                            Ok(decoded_samples) => Some((
+                                decoded_samples,
+                                payload_kind,
+                                payload_len,
+                                payload_prefix,
+                                probe.candidate_count,
+                                probe.decoded_count,
+                                probe.non_silent_count,
+                                probe.best_peak,
+                            )),
+                            Err(e) => {
+                                debug!(error = %e, ssrc = ?current_ssrc, payload_kind, "AAC decode failed on selected probe candidate");
+                                None
+                            }
+                        }
                     } else {
                         let (aac_payload, payload_kind) = select_aac_payload(&plaintext);
                         let payload_len = aac_payload.len();
@@ -688,6 +773,10 @@ async fn receive_loop(
                                     payload_kind,
                                     payload_len,
                                     payload_prefix,
+                                    probe.candidate_count,
+                                    probe.decoded_count,
+                                    probe.non_silent_count,
+                                    probe.best_peak,
                                 ),
                             ),
                             Err(e) => {
@@ -708,6 +797,10 @@ async fn receive_loop(
                             "alac",
                             plaintext.len(),
                             prefix_hex(&plaintext, 16),
+                            0usize,
+                            0usize,
+                            0usize,
+                            0.0f32,
                         )
                     })
                 }
@@ -715,8 +808,8 @@ async fn receive_loop(
         } else {
             None
         }
-        .map_or((None, "none", 0usize, String::new()), |(samples, kind, payload_len, payload_prefix)| {
-            (Some(samples), kind, payload_len, payload_prefix)
+        .map_or((None, "none", 0usize, String::new(), 0usize, 0usize, 0usize, 0.0f32), |(samples, kind, payload_len, payload_prefix, candidate_count, decoded_count, non_silent_count, best_peak)| {
+            (Some(samples), kind, payload_len, payload_prefix, candidate_count, decoded_count, non_silent_count, best_peak)
         });
 
         if let Some(samples) = samples {
@@ -749,6 +842,10 @@ async fn receive_loop(
                     decoded_amp_max,
                     enqueue_amp_min,
                     enqueue_amp_max,
+                    aac_candidate_count,
+                    aac_decoded_count,
+                    aac_non_silent_count,
+                    aac_best_peak,
                 },
             );
             cvar.notify_all();
@@ -835,6 +932,10 @@ fn delivery_loop(
                     decoded_amp_max = frame.decoded_amp_max,
                     enqueue_amp_min = frame.enqueue_amp_min,
                     enqueue_amp_max = frame.enqueue_amp_max,
+                    aac_candidate_count = frame.aac_candidate_count,
+                    aac_decoded_count = frame.aac_decoded_count,
+                    aac_non_silent_count = frame.aac_non_silent_count,
+                    aac_best_peak = frame.aac_best_peak,
                     process_amp_min,
                     process_amp_max,
                     "AP2 buffered frame amplitudes decode/enqueue/process"
