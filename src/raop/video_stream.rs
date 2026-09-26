@@ -137,7 +137,6 @@ async fn process(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::RngCore;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -189,13 +188,12 @@ mod tests {
         (server, client)
     }
 
-    fn random_key_iv() -> ([u8; 16], [u8; 16]) {
-        let mut key = [0u8; 16];
-        let mut iv = [0u8; 16];
-        let mut rng = rand::thread_rng();
-        rng.fill_bytes(&mut key);
-        rng.fill_bytes(&mut iv);
-        (key, iv)
+    fn deterministic_key_iv(key_label: &str, iv_label: &str) -> ([u8; 16], [u8; 16]) {
+        let key_byte =
+            u8::from_str_radix(key_label, 16).expect("deterministic key label must be hex");
+        let iv_byte =
+            u8::from_str_radix(iv_label, 16).expect("deterministic iv label must be hex");
+        ([key_byte; 16], [iv_byte; 16])
     }
 
     #[test]
@@ -237,7 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_decrypts_payload_skips_empty_and_ends_on_oversized_payload() {
-        let (key, iv) = random_key_iv();
+        let (key, iv) = deterministic_key_iv("11", "22");
 
         let (server, mut client) = connected_tcp_pair().await;
 
@@ -294,7 +292,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_accepts_expected_peer_and_processes_stream() {
-        let (key, iv) = random_key_iv();
+        let (key, iv) = deterministic_key_iv("33", "44");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
