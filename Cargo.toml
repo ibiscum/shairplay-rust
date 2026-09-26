@@ -68,7 +68,7 @@ hkdf = { version = "0.12", optional = true }
 num-bigint = { version = "^0.5", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 rubato = { version = "5", optional = true }
-symphonia = { version = "0.6", optional = true, features = ["aac"] }
+fdk-aac-rust = { version = "0.2.3", default-features = false, optional = true }
 
 # Error handling
 thiserror = "2"
@@ -90,7 +90,7 @@ pipewire-auth-setup-compat = []
 diagnostic-headers = []
 dangerous-raw-headers = ["diagnostic-headers"]
 resample = ["dep:rubato"]
-ap2 = ["resample", "dep:chacha20poly1305", "dep:hkdf", "dep:num-bigint", "dep:uuid", "dep:symphonia"]
+ap2 = ["resample", "dep:chacha20poly1305", "dep:hkdf", "dep:num-bigint", "dep:uuid", "dep:fdk-aac-rust"]
 video = ["ap2"]
 hls = ["video"]
 

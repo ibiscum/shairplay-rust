@@ -12,7 +12,7 @@
 | Encrypted RTSP transport | — | ChaCha20-Poly1305, HKDF-SHA512 key derivation |
 | FairPlay handshake | — | Full fp-setup M1/M2 |
 | PTP timing | — | ⚠ Listener now runs (binds + drains 319/320 to kill the connect stall); offsets still **not wired** to playout — see [Open / Unwired](#open--unwired--scaffolding-present-not-connected) |
-| Buffered audio | 103 | AAC decode (symphonia), per-packet ChaCha20 decrypt |
+| Buffered audio | 103 | AAC decode (fdk-aac-rust), per-packet ChaCha20 decrypt |
 | Multichannel | 103 | 5.1/7.1 AAC → stereo mixdown (ITU-R BS.775) |
 | Resampling | 103 | rubato StreamResampler, any rate → output rate |
 | Timed playout buffer | 103 | Pause/resume/flush, stale frame discard |
@@ -21,6 +21,12 @@
 | Realtime audio | 96 | ALAC decode, ChaCha20 decrypt, immediate delivery |
 | **Video (screen mirroring)** | **110** | **AES-128-CTR decrypt, H.264 decode, working on iOS 18** |
 | Unified output | — | Always F32LE interleaved PCM to app |
+
+AAC backend rationale: the AP2 audio path currently uses AAC-LC frames, but the
+decoder backend was switched to `fdk-aac-rust` for explicit profile-aware
+decoder configuration and transport parsing controls. This keeps current
+behavior stable while enabling future support for additional AAC profiles with
+the same backend.
 
 Build note: AP2 crypto dependencies are constrained to digest-compatible major
 versions; `hkdf` is pinned to `0.12` to stay compatible with the crate's
