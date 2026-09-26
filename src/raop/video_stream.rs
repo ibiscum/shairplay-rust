@@ -137,6 +137,7 @@ async fn process(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::RngCore;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
