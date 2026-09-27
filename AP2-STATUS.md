@@ -1,5 +1,9 @@
 # AirPlay 2 — Implementation Status & Research
 
+Related status docs:
+- [AP1-STATUS.md](AP1-STATUS.md) for classic AirPlay (RAOP) implementation/parity.
+- [README.md](README.md#implementation-status) for the top-level status index.
+
 ## Complete
 
 | Feature | Stream Type | Details |
