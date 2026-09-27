@@ -234,6 +234,10 @@ assertions are disabled. Control characters remain escaped in every mode.
 
 ## Implementation Status
 
+Status docs index:
+- [AP1-STATUS.md](AP1-STATUS.md) — classic AirPlay (RAOP) capability and parity status.
+- [AP2-STATUS.md](AP2-STATUS.md) — AirPlay 2 capability, gaps, and research status.
+
 ### ✅ AirPlay 1 — Production Ready
 
 Rock solid. ALAC and raw L16 PCM decoding, optional AES encryption, DACP remote control, metadata (artwork, progress, track info). Works with iPhone, iPad, Mac, iTunes, and PipeWire senders.

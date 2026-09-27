@@ -1,5 +1,9 @@
 # AirPlay 2 — Implementation Status & Research
 
+Related status docs:
+- [AP1-STATUS.md](AP1-STATUS.md) for classic AirPlay (RAOP) implementation/parity.
+- [README.md](README.md#implementation-status) for the top-level status index.
+
 ## Complete
 
 | Feature | Stream Type | Details |
@@ -25,6 +29,41 @@
 Build note: AP2 crypto dependencies are constrained to digest-compatible major
 versions; `hkdf` is pinned to `0.12` to stay compatible with the crate's
 `sha2`/`hmac` stack and keep `--features ap2` buildable.
+
+## Capability Comparison vs `AIRPLAY_2_SPEC.md`
+
+Reference compared: `https://github.com/lmcgartland/airplay2-rs/blob/master/AIRPLAY_2_SPEC.md`
+
+Scope note: that document is sender-oriented; this table maps those capability
+areas onto this repository's receiver implementation.
+
+| Capability Area from Spec | Status in `shairplay-rust` | Notes |
+|---|---|---|
+| mDNS discovery (`_airplay._tcp`, `_raop._tcp`) | ✅ Implemented | Advertised and used in runtime; see Complete table above. |
+| `_airplay-p2p._tcp` / AWDL peer-to-peer | ❌ Missing | Out of scope currently. |
+| Feature/status advertisement (`features`, `sf`) | ✅ Implemented | Receiver advertises AP2 feature profile and paired-state status flags. |
+| HKP pair-setup (normal/persistent) | ✅ Implemented | Persistent pairing path supported with PairingStore. |
+| HKP pair-setup (transient) | ✅ Implemented | SRP transient pairing path supported. |
+| HKP pair-verify | ✅ Implemented | Used for persistent pairing reconnect/authentication. |
+| HKDF key derivation for control transport | ✅ Implemented | HKDF-SHA512 in AP2 control-plane crypto. |
+| Encrypted RTSP control framing (ChaCha20-Poly1305) | ✅ Implemented | Bidirectional encrypted transport is in production path. |
+| `/fp-setup` FairPlay control-plane handshake | ✅ Implemented | Handshake is complete in AP2 profile. |
+| `/auth-setup` (MFi-SAP) | ❌ Missing | Explicitly not implemented; see section below. |
+| Two-phase binary-plist `SETUP` negotiation | ✅ Implemented | Event/timing + stream-definition setup is live. |
+| Stream type 103 buffered audio (AAC) | ✅ Implemented | Buffered AAC path, timed playout, decrypt/decode/resample pipeline. |
+| Stream type 96 realtime audio (ALAC) | ✅ Implemented | Realtime ALAC path with immediate delivery. |
+| Stream type 120 (video relay/HLS control stream) | ❌ Missing | Not implemented as a dedicated AP2 stream type yet. |
+| RTP audio payload protection (ChaCha20-Poly1305) | ✅ Implemented | AP2 encrypted RTP handling is implemented. |
+| RTP retransmit request/reply handling (PT=85/86) | ⚠️ Partial/Unverified | Not claimed as complete in this status doc; needs explicit verification coverage. |
+| NTP-style timing participation | ✅ Implemented | Receiver handles classic timing path for audio operation. |
+| PTP participation for AP2 | ⚠️ Partial | Listener/sink is active; offset computation and playout clock wiring are still open. |
+| Multi-room clock-synchronous playout | ❌ Missing | Not yet wired (depends on full PTP offset/planning integration). |
+| Multi-room peer coordination (`SETPEERS`-style) | ❌ Missing | Not currently documented as implemented. |
+| Ongoing outbound event reporting | ⚠️ Partial | Event channel exists and sends initial `updateInfo`; ongoing reporting remains unwired. |
+| Metadata/volume/artwork forwarding | ✅ Implemented | Forwarded through handler APIs. |
+| AP2 remote playback control back to iPhone | ❌ Missing | Research item; third-party receiver trust limits still apply. |
+
+Legend: ✅ implemented, ⚠️ partial or not fully verified, ❌ missing.
 
 ## MFi `/auth-setup` — Not Implemented
 
@@ -246,3 +285,4 @@ See previous sections for full remote control research (unchanged).
 - [UxPlay](https://github.com/FDH2/UxPlay) — working screen mirroring reference
 - [pair_ap](https://github.com/ejurgensen/pair_ap)
 - [shairport-sync](https://github.com/mikebrady/shairport-sync)
+- [airplay2-rs](https://github.com/lmcgartland/airplay2-rs/blob/master/AIRPLAY_2_SPEC.md)

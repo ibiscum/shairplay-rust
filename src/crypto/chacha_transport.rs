@@ -181,17 +181,7 @@ impl EncryptedChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::RngCore;
 
-    fn random_key() -> [u8; 32] {
-        rand::random::<[u8; 32]>()
-    }
-
-    fn random_secret() -> [u8; 64] {
-        let mut secret = [0u8; 64];
-        rand::thread_rng().fill_bytes(&mut secret);
-        secret
-    }
 
     fn encrypt_expected_frame(key: [u8; 32], counter: u64, plain: &[u8]) -> Vec<u8> {
         let cipher = ChaCha20Poly1305::new((&key).into());
@@ -223,9 +213,23 @@ mod tests {
         out
     }
 
+    fn deterministic_key(label: &str) -> [u8; 32] {
+        let byte = u8::from_str_radix(label, 16).expect("deterministic key label must be hex");
+        [byte; 32]
+    }
+
+    fn deterministic_secret(label: &str) -> [u8; 64] {
+        let byte = u8::from_str_radix(label, 16).expect("deterministic secret label must be hex");
+        [byte; 64]
+    }
+
+    fn hex_encode(data: &[u8]) -> String {
+        data.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     #[test]
     fn roundtrip_single_block() {
-        let key = random_key();
+        let key = deterministic_key("01");
         let mut enc = CipherContext::new(key);
         let mut dec = CipherContext::new(key);
 
@@ -238,7 +242,7 @@ mod tests {
 
     #[test]
     fn roundtrip_multi_block() {
-        let key = random_key();
+        let key = deterministic_key("02");
         let mut enc = CipherContext::new(key);
         let mut dec = CipherContext::new(key);
 
@@ -255,7 +259,7 @@ mod tests {
 
     #[test]
     fn incremental_decrypt() {
-        let key = random_key();
+        let key = deterministic_key("03");
         let mut enc = CipherContext::new(key);
         let mut dec = CipherContext::new(key);
 
@@ -274,7 +278,7 @@ mod tests {
 
     #[test]
     fn corrupted_tag_rejected() {
-        let key = random_key();
+        let key = deterministic_key("04");
         let mut enc = CipherContext::new(key);
         let mut dec = CipherContext::new(key);
 
@@ -288,7 +292,7 @@ mod tests {
 
     #[test]
     fn encrypted_channel_control() {
-        let secret = random_secret();
+        let secret = deterministic_secret("55");
         let server = EncryptedChannel::control(&secret).unwrap();
         assert_ne!(server.encrypt_ctx.key, [0u8; 32]);
         assert_ne!(server.decrypt_ctx.key, [0u8; 32]);
@@ -297,7 +301,7 @@ mod tests {
 
     #[test]
     fn encrypted_channel_events() {
-        let secret = random_secret();
+        let secret = deterministic_secret("33");
         let server = EncryptedChannel::events(&secret).unwrap();
         assert_ne!(server.encrypt_ctx.key, [0u8; 32]);
         assert_ne!(server.decrypt_ctx.key, [0u8; 32]);
@@ -306,7 +310,7 @@ mod tests {
 
     #[test]
     fn encrypt_empty_plaintext_is_noop() {
-        let key = random_key();
+        let key = deterministic_key("05");
         let mut enc = CipherContext::new(key);
         let ct = enc.encrypt(&[]).unwrap();
         assert!(ct.is_empty());
@@ -315,7 +319,7 @@ mod tests {
 
     #[test]
     fn decrypt_rejects_zero_length_frame() {
-        let key = random_key();
+        let key = deterministic_key("06");
         let mut dec = CipherContext::new(key);
         // Complete frame for block_len=0: [len(2)] + [tag(16)].
         let mut frame = vec![0u8; 2 + TAG_LEN];
@@ -329,7 +333,7 @@ mod tests {
 
     #[test]
     fn encrypt_rejects_counter_exhaustion() {
-        let key = random_key();
+        let key = deterministic_key("07");
         let mut enc = CipherContext::new(key);
         enc.counter = u64::MAX;
         assert!(matches!(
@@ -340,7 +344,7 @@ mod tests {
 
     #[test]
     fn decrypt_rejects_counter_exhaustion() {
-        let key = random_key();
+        let key = deterministic_key("08");
         let mut enc = CipherContext::new(key);
         let frame = enc.encrypt(b"x").unwrap();
 
@@ -356,17 +360,19 @@ mod tests {
 
     #[test]
     fn c_vector_single_block() {
-        let key = random_key();
+        let key = deterministic_key("42");
         let mut enc = CipherContext::new(key);
         let plain = b"Hello, AirPlay 2!";
         let ct = enc.encrypt(plain).unwrap();
-        let expected = encrypt_expected_frame(key, 0, plain);
-        assert_eq!(ct, expected);
+        assert_eq!(
+            hex_encode(&ct),
+            "1100110388477298138c85d304589e56888a9fdf4df47289f10c4d8bf4f3052c1b7014"
+        );
     }
 
     #[test]
     fn c_vector_counter_0() {
-        let key = random_key();
+        let key = deterministic_key("ab");
         let mut enc = CipherContext::new(key);
         let plain: Vec<u8> = (0u8..100).collect();
         let ct = enc.encrypt(&plain).unwrap();
@@ -376,7 +382,7 @@ mod tests {
 
     #[test]
     fn c_vector_counter_1() {
-        let key = random_key();
+        let key = deterministic_key("ab");
         let mut enc = CipherContext::new(key);
         enc.counter = 1; // Skip to counter=1
         let plain: Vec<u8> = (0u8..100).collect();

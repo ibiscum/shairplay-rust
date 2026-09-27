@@ -14,6 +14,8 @@ pub(crate) struct StreamResampler {
     chunk_size: usize,
     /// Accumulated input samples (interleaved).
     pending: Vec<f32>,
+    /// Reused deinterleaved per-channel scratch buffers.
+    deinterleave_scratch: Vec<Vec<f32>>,
 }
 
 impl StreamResampler {
@@ -34,11 +36,15 @@ impl StreamResampler {
         let resampler =
             Async::<f32>::new_sinc(ratio, 1.0, &params, chunk_size, channels, FixedAsync::Input)
                 .ok()?;
+        let deinterleave_scratch = (0..channels)
+            .map(|_| Vec::with_capacity(chunk_size))
+            .collect();
         Some(Self {
             resampler,
             channels,
             chunk_size,
             pending: Vec::new(),
+            deinterleave_scratch,
         })
     }
 
@@ -51,31 +57,44 @@ impl StreamResampler {
 
         let samples_per_chunk = self.chunk_size * self.channels;
         let mut output = Vec::new();
+        let mut consumed = 0usize;
 
-        while self.pending.len() >= samples_per_chunk {
-            let chunk: Vec<f32> = self.pending.drain(..samples_per_chunk).collect();
+        while self.pending.len().saturating_sub(consumed) >= samples_per_chunk {
+            let chunk = &self.pending[consumed..consumed + samples_per_chunk];
 
             // Deinterleave
-            let mut ch_vecs: Vec<Vec<f32>> = (0..self.channels)
-                .map(|_| Vec::with_capacity(self.chunk_size))
-                .collect();
+            self.deinterleave_scratch
+                .iter_mut()
+                .for_each(|ch| ch.clear());
             for frame in chunk.chunks_exact(self.channels) {
                 for (ch, &s) in frame.iter().enumerate() {
-                    ch_vecs[ch].push(s);
+                    self.deinterleave_scratch[ch].push(s);
                 }
             }
 
-            let input = match SequentialSliceOfVecs::new(&ch_vecs, self.channels, self.chunk_size) {
+            let input = match SequentialSliceOfVecs::new(
+                &self.deinterleave_scratch,
+                self.channels,
+                self.chunk_size,
+            ) {
                 Ok(i) => i,
-                Err(_) => continue,
+                Err(_) => break,
             };
 
-            if let Ok(result) = self.resampler.process(&input, None) {
-                let data = result.take_data();
-                if !data.is_empty() {
-                    output.extend(data);
+            match self.resampler.process(&input, None) {
+                Ok(result) => {
+                    let data = result.take_data();
+                    if !data.is_empty() {
+                        output.extend(data);
+                    }
+                    consumed += samples_per_chunk;
                 }
+                Err(_) => break,
             }
+        }
+
+        if consumed > 0 {
+            self.pending.drain(..consumed);
         }
 
         output
