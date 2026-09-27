@@ -358,8 +358,9 @@ fn predictor_decompress_fir_adapt(
                     * predictor_coef_table[j] as i64;
             }
 
-            let mut outval =
-                ((1i64 << (predictor_quantitization - 1)) + sum) >> predictor_quantitization;
+            let pq = predictor_quantitization.max(0) as u32;
+            let rounding = if pq == 0 { 0 } else { 1i64 << (pq - 1) };
+            let mut outval = (rounding + sum) >> pq;
             outval += buffer_out[off] as i64 + error_val as i64;
             let outval = sign_extend_32(outval as i32, readsamplesize);
             buffer_out[off + predictor_coef_num + 1] = outval;
@@ -400,14 +401,6 @@ fn deinterlace_16(
     shift: u8,
     leftweight: u8,
 ) {
-    let _out_i16: &mut [i16] = {
-        // Safe reinterpretation: out is aligned and sized for i16
-        let _ptr = out.as_mut_ptr() as *mut i16;
-        let _len = out.len() / 2;
-        // SAFETY: not needed — we write byte-by-byte instead
-        &mut []
-    };
-
     for i in 0..num_samples {
         let (left, right) = if leftweight != 0 {
             let mid = buf_a[i];
@@ -681,7 +674,7 @@ impl AlacDecoder {
         entropy_rice_decode(reader, prederr, output_samples, readsamplesize, &rice);
         let mut pred_table = hdr.pred_table;
         predictor_decompress_fir_adapt(
-            &prederr.clone(),
+            prederr,
             out,
             output_samples,
             readsamplesize,
