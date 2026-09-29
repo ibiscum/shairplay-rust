@@ -587,7 +587,7 @@ impl BufferedAudioProcessor {
     /// Start the processing pipeline. Returns a command sender for playback control.
     pub(crate) fn start(
         self,
-        shk: [u8; 32],
+        shk: crate::crypto::chacha_transport::StreamSharedKey,
         output_config: OutputConfig,
         handler: Arc<dyn AudioHandler>,
     ) -> tokio::sync::mpsc::UnboundedSender<PlayoutCommand> {
@@ -645,7 +645,7 @@ impl BufferedAudioProcessor {
                 }
             };
             info!(%addr, "Buffered audio client connected");
-            receive_loop(stream, &shk, output_config, state4, &handler).await;
+            receive_loop(stream, shk, output_config, state4, &handler).await;
         });
 
         cmd_tx
@@ -655,14 +655,14 @@ impl BufferedAudioProcessor {
 /// TCP receive loop: reads length-prefixed packets, decrypts, decodes, buffers.
 async fn receive_loop(
     mut stream: TcpStream,
-    shk: &[u8; 32],
+    shk: crate::crypto::chacha_transport::StreamSharedKey,
     output_config: OutputConfig,
     state: Arc<(Mutex<PlayoutState>, Condvar)>,
     handler: &Arc<dyn AudioHandler>,
 ) {
     use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
 
-    let cipher = ChaCha20Poly1305::new(shk.into());
+    let cipher = ChaCha20Poly1305::new(shk.as_array().into());
     let mut len_buf = [0u8; 2];
     let mut decoder: Option<BufferedDecoder> = None;
     let mut current_ssrc = AudioSsrc::None;
@@ -1131,7 +1131,7 @@ mod tests {
 
         receive_loop(
             server_stream,
-            &[1u8; 32],
+            crate::crypto::chacha_transport::StreamSharedKey::from_slice(&[1u8; 32]).unwrap(),
             OutputConfig {
                 sample_rate: None,
                 max_channels: None,

@@ -28,7 +28,6 @@ include = [
     "/LICENSE",
     "/AP2-STATUS.md",
     "/docs/**",
-    "/airport.key",
 ]
 # rust-version = "1.94"
 
@@ -76,6 +75,8 @@ thiserror = "2"
 # Logging
 tracing = "0.1"
 hex = "0.4"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+dotenvy = "0.15"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 astro-dnssd = "0.3"

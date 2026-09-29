@@ -125,6 +125,7 @@ let mut server = RaopServer::builder()
 | `.header_diagnostics()` | `Disabled` | `diagnostic-headers` | Structured, redacted RTSP header diagnostics |
 | `.advertise_codecs()` | PCM + ALAC | AP1 | Set the ordered AP1 `cn` capability list |
 | `.advertise_encryption()` | none | AP1 | Set the ordered AP1 `et` capability list |
+| `.rsa_key_path()` | `SHAIRPLAY_RSA_KEY_PEM` / `SHAIRPLAY_RSA_KEY_PATH` env vars | | PKCS#1 PEM private key source for RAOP signing/decryption |
 | `.output_sample_rate()` | source rate | `resample` | Resample all audio to this rate |
 | `.output_max_channels()` | source channels | `resample` | Mix down to this channel count |
 | `.pin()` | `"3939"` | `ap2` | PIN for HomeKit pairing |
@@ -132,6 +133,29 @@ let mut server = RaopServer::builder()
 | `.pairing_store()` | `MemoryPairingStore` | `ap2` | Persistent key storage |
 | `.video_handler()` | none | `video` | Video session factory |
 | `.hls_handler()` | none | `hls` | HLS video playback handler |
+
+### RSA Key Configuration
+
+RAOP challenge signing and RSA key decryption require a PKCS#1 PEM private key.
+Load it via `.env` with a PEM env var (preferred) or path env var:
+
+```dotenv
+SHAIRPLAY_RSA_KEY_PEM="-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----"
+# Optional alternative:
+# SHAIRPLAY_RSA_KEY_PATH=/etc/shairplay/airport.key
+```
+
+You can also set a key file path in code:
+
+```rust
+let mut server = RaopServer::builder()
+    .name("My Speaker")
+    .rsa_key_path("/etc/shairplay/airport.key")
+    .build(Arc::new(MyHandler))?;
+```
+
+When `.rsa_key_path(...)` is not set, the server reads `SHAIRPLAY_RSA_KEY_PEM`
+first, then falls back to `SHAIRPLAY_RSA_KEY_PATH`.
 
 ### AirPlay 1 Discovery Capabilities
 

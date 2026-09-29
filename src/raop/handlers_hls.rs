@@ -292,7 +292,7 @@ mod tests {
     fn test_connection(hls_handler: Option<Arc<dyn HlsHandler>>) -> RaopConnection {
         let hwaddr = vec![0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
         let shared = Arc::new(RaopShared {
-            rsakey: Arc::new(RsaKey::from_pem(include_str!("../../airport.key")).unwrap()),
+            rsakey: Arc::new(RsaKey::from_env(None).unwrap()),
             pairing: Arc::new(Pairing::generate().unwrap()),
             hwaddr,
             password: String::new(),

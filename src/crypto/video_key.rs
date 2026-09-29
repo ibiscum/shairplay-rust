@@ -10,6 +10,8 @@
 
 use sha2::{Digest, Sha512};
 
+use crate::crypto::constants::{VIDEO_STREAM_IV_LABEL, VIDEO_STREAM_KEY_LABEL};
+
 fn sha512_16(parts: &[&[u8]]) -> [u8; 16] {
     let mut h = Sha512::new();
     for p in parts {
@@ -34,11 +36,11 @@ pub(crate) fn derive_stream_key_iv(
     stream_connection_id: u64,
 ) -> ([u8; 16], [u8; 16]) {
     let key = sha512_16(&[
-        format!("AirPlayStreamKey{stream_connection_id}").as_bytes(),
+        format!("{VIDEO_STREAM_KEY_LABEL}{stream_connection_id}").as_bytes(),
         seed,
     ]);
     let iv = sha512_16(&[
-        format!("AirPlayStreamIV{stream_connection_id}").as_bytes(),
+        format!("{VIDEO_STREAM_IV_LABEL}{stream_connection_id}").as_bytes(),
         seed,
     ]);
     (key, iv)

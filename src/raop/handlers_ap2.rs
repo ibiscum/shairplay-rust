@@ -90,7 +90,9 @@ pub(crate) fn handle_pair_setup(
             let ok = srp.process_m3(data).ok()?;
             let m4 = srp.build_m4().ok()?;
             if ok && srp.is_transient() {
-                conn.ap2_shared_secret = srp.shared_secret().map(|s| s.to_vec());
+                conn.ap2_shared_secret = srp
+                    .shared_secret()
+                    .map(|s| zeroize::Zeroizing::new(s.to_vec()));
                 conn.is_ap2 = true;
                 tracing::info!("AP2 transient pair-setup complete");
             }
@@ -172,7 +174,9 @@ pub(crate) fn handle_pair_verify(
             match pv.process_m3_build_m4(data, Some(&|id| store.get(id))) {
                 Ok(m4) => {
                     conn.pair_verify_secret = pv.shared_secret().copied();
-                    conn.ap2_shared_secret = pv.shared_secret().map(|s| s.to_vec());
+                    conn.ap2_shared_secret = pv
+                        .shared_secret()
+                        .map(|s| zeroize::Zeroizing::new(s.to_vec()));
                     conn.is_ap2 = true;
                     tracing::info!("AP2 pair-verify complete, encrypted RTSP active");
                     Some(m4)
@@ -478,7 +482,7 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
                         use sha2::{Digest, Sha512};
                         let mut hasher = Sha512::new();
                         hasher.update(fp_key);
-                        hasher.update(secret);
+                        hasher.update(secret.as_slice());
                         let hash = hasher.finalize();
                         let mut key = [0u8; 16];
                         key.copy_from_slice(&hash[..16]);
@@ -523,7 +527,7 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
             let event_port = event_listener.local_addr().ok()?.port();
 
             if let Ok(event_channel_cipher) =
-                crate::crypto::chacha_transport::EncryptedChannel::events(shared_secret)
+                crate::crypto::chacha_transport::EncryptedChannel::events(shared_secret.as_slice())
             {
                 let event_sender = {
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -574,7 +578,7 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
     // In legacy mode there's no shared secret — skip the encrypted event channel.
     if let Some(shared_secret) = conn.ap2_shared_secret.as_ref()
         && let Ok(event_channel_cipher) =
-            crate::crypto::chacha_transport::EncryptedChannel::events(shared_secret)
+            crate::crypto::chacha_transport::EncryptedChannel::events(shared_secret.as_slice())
     {
         // Spawn bidirectional event channel
         let event_sender = {
@@ -675,9 +679,12 @@ fn setup_stream_realtime(
         bit_depth: 16,
         channels: 2,
     });
-    let shk = stream0.get("shk").and_then(|v| v.as_data()).unwrap_or(&[]);
+    let shk = stream0
+        .get("shk")
+        .and_then(|v| v.as_data())
+        .and_then(crate::crypto::chacha_transport::StreamSharedKey::from_slice);
 
-    if shk.len() == 32 {
+    if let Some(shk) = shk {
         // AP2 realtime ALAC — ChaCha20-Poly1305 per-packet encryption.
         tracing::info!(
             stream_type = 96,
@@ -694,9 +701,6 @@ fn setup_stream_realtime(
                 "Unknown AP2 realtime ALAC audioFormat; falling back to SETUP sr and 16-bit stereo"
             );
         }
-        let mut shk_arr = [0u8; 32];
-        shk_arr.copy_from_slice(shk);
-
         let socket = bind_udp(bind_addr_for(conn))?;
         let audio_port = socket.local_addr().ok()?.port();
 
@@ -712,7 +716,7 @@ fn setup_stream_realtime(
 
         let handle = tokio::spawn(crate::raop::realtime_audio::run(
             socket,
-            shk_arr,
+            shk,
             handler,
             output_config,
         ));
@@ -790,20 +794,15 @@ fn setup_stream_buffered(
     );
 
     let shk = stream0.get("shk").and_then(|v| v.as_data()).unwrap_or(&[]);
-    if shk.len() != 32 {
-        tracing::warn!(len = shk.len(), "Invalid shk length");
+    let Some(shk) = crate::crypto::chacha_transport::StreamSharedKey::from_slice(shk) else {
+        tracing::warn!("Invalid buffered stream setup key");
         conn.shared
             .handler
             .on_error(&ShairplayError::Protocol(ProtocolError::InvalidRtsp(
-                format!(
-                    "buffered (type 103) SETUP: invalid shk length {}",
-                    shk.len()
-                ),
+                "buffered (type 103) SETUP contains invalid key material".into(),
             )));
         return None;
-    }
-    let mut shk_arr = [0u8; 32];
-    shk_arr.copy_from_slice(shk);
+    };
 
     let listener = bind_tcp(bind_addr_for(conn))?;
     let audio_port = listener.local_addr().ok()?.port();
@@ -816,7 +815,7 @@ fn setup_stream_buffered(
     };
 
     let proc = crate::raop::buffered_audio::BufferedAudioProcessor { listener };
-    let cmd_tx = proc.start(shk_arr, output_config, handler);
+    let cmd_tx = proc.start(shk, output_config, handler);
     conn.playout_cmd = Some(cmd_tx.clone());
     conn.shared.set_active_audio(Box::new(move || {
         let _ = cmd_tx.send(crate::raop::buffered_audio::PlayoutCommand::Stop);
@@ -880,7 +879,7 @@ fn setup_stream_video(
             conn.shared
                 .handler
                 .on_error(&ShairplayError::Crypto(CryptoError::FairPlay(
-                    "video stream key derivation: negative streamConnectionID".into(),
+                    "video stream setup failed".into(),
                 )));
             return None;
         }
@@ -905,14 +904,7 @@ fn setup_stream_video(
         let fp_key = conn.shared.video_ekey.read().ok().and_then(|k| *k);
         if let Some(fp_key) = fp_key {
             let eaes_key = crate::crypto::video_key::derive_eaes_key(&fp_key, ecdh);
-            let (key, iv) =
-                crate::crypto::video_key::derive_stream_key_iv(&eaes_key, stream_connection_id);
-            tracing::debug!(
-                derived_key = %hex::encode(key),
-                derived_iv = %hex::encode(iv),
-                "Video key: 3-step derivation (FairPlay + ECDH)"
-            );
-            (key, iv)
+            crate::crypto::video_key::derive_stream_key_iv(&eaes_key, stream_connection_id)
         } else {
             // iOS 18+ with HomeKit pairing does not send ekey; derivation is unsolved
             // (see AP2-STATUS.md). Decline the stream rather than installing a zeroed key
@@ -923,7 +915,7 @@ fn setup_stream_video(
             conn.shared
                 .handler
                 .on_error(&ShairplayError::Crypto(CryptoError::FairPlay(
-                    "video stream key derivation: no ekey (iOS 18 HomeKit unsupported)".into(),
+                    "video stream setup failed".into(),
                 )));
             return None;
         }
@@ -932,7 +924,7 @@ fn setup_stream_video(
         conn.shared
             .handler
             .on_error(&ShairplayError::Crypto(CryptoError::FairPlay(
-                "video stream key derivation: no encryption keys available".into(),
+                "video stream setup failed".into(),
             )));
         return None;
     };
@@ -1311,7 +1303,7 @@ mod tests {
 
     fn test_connection_with_handler(handler: Arc<dyn AudioHandler>) -> RaopConnection {
         let shared = Arc::new(RaopShared {
-            rsakey: Arc::new(RsaKey::from_pem(include_str!("../../airport.key")).unwrap()),
+            rsakey: Arc::new(RsaKey::from_env(None).unwrap()),
             pairing: Arc::new(Pairing::generate().unwrap()),
             hwaddr: vec![0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
             password: String::new(),
@@ -1753,7 +1745,7 @@ mod tests {
     #[tokio::test]
     async fn setup_initial_rc_only_returns_event_port_when_shared_secret_present() {
         let mut conn = test_connection();
-        conn.ap2_shared_secret = Some(vec![0xAA; 32]);
+        conn.ap2_shared_secret = Some(zeroize::Zeroizing::new(vec![0xAA; 32]));
 
         let mut dict = plist::Dictionary::new();
         dict.insert("isRemoteControlOnly".into(), plist::Value::Boolean(true));

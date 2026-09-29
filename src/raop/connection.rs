@@ -256,7 +256,7 @@ impl ConnectionHandler for RaopConnectionHandler {
         if self.cipher.is_none()
             && let Some(secret) = &self.conn.ap2_shared_secret
         {
-            self.pending_secret = Some(secret.clone());
+            self.pending_secret = Some(secret.as_slice().to_vec());
         }
 
         resp

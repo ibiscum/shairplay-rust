@@ -76,11 +76,11 @@ fn alac_decoder_info(config: &OutputConfig) -> [u8; 48] {
 /// Run the realtime audio receiver loop.
 pub(crate) async fn run(
     socket: UdpSocket,
-    shk: [u8; 32],
+    shk: crate::crypto::chacha_transport::StreamSharedKey,
     handler: Arc<dyn AudioHandler>,
     output_config: OutputConfig,
 ) {
-    let cipher = ChaCha20Poly1305::new((&shk).into());
+    let cipher = ChaCha20Poly1305::new(shk.as_array().into());
     let mut buf = vec![0u8; 4096];
     let normalized_output_config = normalize_output_config(&output_config);
     if normalized_output_config != output_config {
@@ -298,7 +298,7 @@ mod tests {
 
         let task = tokio::spawn(run(
             receiver,
-            [7u8; 32],
+            crate::crypto::chacha_transport::StreamSharedKey::from_slice(&[7u8; 32]).unwrap(),
             handler,
             OutputConfig {
                 source_sample_rate: 44_100,
@@ -344,7 +344,7 @@ mod tests {
 
         let task = tokio::spawn(run(
             receiver,
-            [9u8; 32],
+            crate::crypto::chacha_transport::StreamSharedKey::from_slice(&[9u8; 32]).unwrap(),
             handler,
             OutputConfig {
                 source_sample_rate: 48_000,

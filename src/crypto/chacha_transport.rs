@@ -12,15 +12,22 @@ use chacha20poly1305::{
 };
 use hkdf::Hkdf;
 use sha2::Sha512;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use crate::crypto::constants::{
+    CONTROL_READ_KEY_INFO, CONTROL_SALT, CONTROL_WRITE_KEY_INFO, EVENTS_READ_KEY_INFO,
+    EVENTS_SALT, EVENTS_WRITE_KEY_INFO,
+};
 use crate::error::CryptoError;
 
 const MAX_BLOCK_LEN: usize = 0x400; // 1024
 const TAG_LEN: usize = 16;
 
 /// Encrypted channel (one direction: either encrypt or decrypt).
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct CipherContext {
     key: [u8; 32],
+    #[zeroize(skip)]
     counter: u64,
 }
 
@@ -121,6 +128,28 @@ impl CipherContext {
     }
 }
 
+/// Shared stream key (`shk`) from AP2 `SETUP` for stream types 96/103.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub(crate) struct StreamSharedKey {
+    key: [u8; 32],
+}
+
+impl StreamSharedKey {
+    /// Parse a 32-byte key from RTSP/plist payload data.
+    pub(crate) fn from_slice(data: &[u8]) -> Option<Self> {
+        if data.len() != 32 {
+            return None;
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(data);
+        Some(Self { key })
+    }
+
+    pub(crate) fn as_array(&self) -> &[u8; 32] {
+        &self.key
+    }
+}
+
 /// Bidirectional encrypted channel for an RTSP connection.
 pub struct EncryptedChannel {
     /// Encrypts outgoing RTSP responses.
@@ -159,10 +188,10 @@ impl EncryptedChannel {
     pub(crate) fn control(shared_secret: &[u8]) -> Result<Self, CryptoError> {
         Self::new(
             shared_secret,
-            "Control-Salt",
-            "Control-Read-Encryption-Key",
-            "Control-Salt",
-            "Control-Write-Encryption-Key",
+            CONTROL_SALT,
+            CONTROL_READ_KEY_INFO,
+            CONTROL_SALT,
+            CONTROL_WRITE_KEY_INFO,
         )
     }
 
@@ -170,10 +199,10 @@ impl EncryptedChannel {
     pub(crate) fn events(shared_secret: &[u8]) -> Result<Self, CryptoError> {
         Self::new(
             shared_secret,
-            "Events-Salt",
-            "Events-Write-Encryption-Key",
-            "Events-Salt",
-            "Events-Read-Encryption-Key",
+            EVENTS_SALT,
+            EVENTS_WRITE_KEY_INFO,
+            EVENTS_SALT,
+            EVENTS_READ_KEY_INFO,
         )
     }
 }

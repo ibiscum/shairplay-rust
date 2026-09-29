@@ -31,7 +31,7 @@ pub(crate) struct RaopConnection {
     #[cfg(feature = "ap2")]
     pub(crate) pair_verify: Option<PairVerifyServer>,
     #[cfg(feature = "ap2")]
-    pub(crate) ap2_shared_secret: Option<Vec<u8>>,
+    pub(crate) ap2_shared_secret: Option<zeroize::Zeroizing<Vec<u8>>>,
     /// X25519 shared secret from pair-verify (32 bytes). Used for video key derivation.
     #[cfg(feature = "ap2")]
     pub(crate) pair_verify_secret: Option<[u8; 32]>,
@@ -504,7 +504,7 @@ mod tests {
 
     fn test_connection(handler: Arc<RecordingHandler>) -> RaopConnection {
         let shared = Arc::new(RaopShared {
-            rsakey: Arc::new(RsaKey::from_pem(include_str!("../../airport.key")).unwrap()),
+            rsakey: Arc::new(RsaKey::from_env(None).unwrap()),
             pairing: Arc::new(Pairing::generate().unwrap()),
             hwaddr: vec![0u8; 6],
             password: String::new(),
@@ -674,7 +674,7 @@ mod ap2_tests {
 
     fn test_connection(handler: Arc<RecordingHandler>, local_addr: Vec<u8>) -> RaopConnection {
         let shared = Arc::new(RaopShared {
-            rsakey: Arc::new(RsaKey::from_pem(include_str!("../../airport.key")).unwrap()),
+            rsakey: Arc::new(RsaKey::from_env(None).unwrap()),
             pairing: Arc::new(Pairing::generate().unwrap()),
             hwaddr: vec![0, 1, 2, 3, 4, 5],
             password: String::new(),

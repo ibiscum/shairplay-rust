@@ -10,17 +10,16 @@ use crate::net::mdns::{AirPlayServiceInfo, MdnsService};
 #[cfg(feature = "diagnostic-headers")]
 use crate::net::protocol_diagnostics::HeaderDiagnostics;
 use crate::net::server::{BindConfig, HttpServer};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const AIRPORT_KEY: &str = include_str!("../../airport.key");
-
-fn airport_rsakey() -> Arc<RsaKey> {
-    use std::sync::OnceLock;
-    static KEY: OnceLock<Arc<RsaKey>> = OnceLock::new();
-    KEY.get_or_init(|| {
-        Arc::new(RsaKey::from_pem(AIRPORT_KEY).expect("built-in airport.key is invalid"))
-    })
-    .clone()
+fn load_rsakey(path_override: Option<&Path>) -> Result<Arc<RsaKey>, ShairplayError> {
+    let rsakey = RsaKey::from_env(path_override).map_err(|_| {
+        ServerError::InvalidConfiguration(
+            "missing/invalid RSA key: set SHAIRPLAY_RSA_KEY_PEM or SHAIRPLAY_RSA_KEY_PATH",
+        )
+    })?;
+    Ok(Arc::new(rsakey))
 }
 
 fn random_hwaddr() -> Vec<u8> {
@@ -79,6 +78,7 @@ pub struct RaopServerBuilder {
     output_max_channels: Option<u8>,
     ap1_codecs: Option<Vec<Ap1Codec>>,
     ap1_encryption: Option<Vec<Ap1Encryption>>,
+    rsa_key_path: Option<PathBuf>,
     #[cfg(feature = "ap2")]
     pin: Option<String>,
     #[cfg(feature = "video")]
@@ -114,6 +114,7 @@ impl RaopServerBuilder {
             output_max_channels: None,
             ap1_codecs: None,
             ap1_encryption: None,
+            rsa_key_path: None,
             #[cfg(feature = "ap2")]
             pin: None,
             #[cfg(feature = "video")]
@@ -243,6 +244,15 @@ impl RaopServerBuilder {
         self
     }
 
+    /// Set the RSA private key file path used for RAOP challenge signing/decryption.
+    ///
+    /// The file must contain a PKCS#1 PEM private key. If unset, the builder
+    /// reads `SHAIRPLAY_RSA_KEY_PEM` or `SHAIRPLAY_RSA_KEY_PATH` from the environment.
+    pub fn rsa_key_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.rsa_key_path = Some(path.into());
+        self
+    }
+
     #[cfg(feature = "ap2")]
     /// Require normal HomeKit pair-setup with this one-time PIN.
     ///
@@ -309,7 +319,7 @@ impl RaopServerBuilder {
             .into());
         }
         let ap1_advertisement = Ap1Advertisement::try_new(self.ap1_codecs, self.ap1_encryption)?;
-        let rsakey = airport_rsakey();
+        let rsakey = load_rsakey(self.rsa_key_path.as_deref())?;
         let pairing = Arc::new(Pairing::generate()?);
         let hwaddr = match self.hwaddr {
             Some(addr) if addr.len() == super::MAX_HWADDR_LEN => addr,

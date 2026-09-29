@@ -1,11 +1,13 @@
 //! RSA key handling for the well-known AirPort Express private key.
 
 use rsa::pkcs1::DecodeRsaPrivateKey;
+use rsa::pkcs8::DecodePrivateKey;
 use rsa::pkcs1v15::SigningKey;
 use rsa::signature::SignatureEncoding;
 use rsa::signature::hazmat::PrehashSigner;
 use rsa::traits::PublicKeyParts;
 use rsa::{Oaep, RsaPrivateKey};
+use std::path::Path;
 
 use base64::Engine as _;
 
@@ -22,6 +24,9 @@ const B64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
         .with_decode_allow_trailing_bits(true),
 );
 
+pub(crate) const RSA_KEY_PEM_ENV: &str = "SHAIRPLAY_RSA_KEY_PEM";
+pub(crate) const RSA_KEY_PATH_ENV: &str = "SHAIRPLAY_RSA_KEY_PATH";
+
 /// RSA key for RAOP authentication. Equivalent to rsakey_t.
 pub(crate) struct RsaKey {
     key: RsaPrivateKey,
@@ -30,9 +35,41 @@ pub(crate) struct RsaKey {
 impl RsaKey {
     /// Load an RSA private key from a PEM string. Equivalent to rsakey_init_pem.
     pub(crate) fn from_pem(pem: &str) -> Result<Self, CryptoError> {
-        let key =
-            RsaPrivateKey::from_pkcs1_pem(pem).map_err(|e| CryptoError::RsaKey(e.to_string()))?;
+        let key = RsaPrivateKey::from_pkcs1_pem(pem)
+            .or_else(|_| RsaPrivateKey::from_pkcs8_pem(pem))
+            .map_err(|e| CryptoError::RsaKey(e.to_string()))?;
         Ok(Self { key })
+    }
+
+    /// Load the RSA key from a PEM string env var or PEM file path.
+    ///
+    /// Resolution order:
+    /// 1) `path_override` argument (if provided)
+    /// 2) `SHAIRPLAY_RSA_KEY_PEM` (supports `\\n` escaped newlines)
+    /// 3) `SHAIRPLAY_RSA_KEY_PATH`
+    pub(crate) fn from_env(path_override: Option<&Path>) -> Result<Self, CryptoError> {
+        let _ = dotenvy::dotenv();
+
+        if let Some(path) = path_override {
+            let pem = std::fs::read_to_string(path)
+                .map_err(|_| CryptoError::RsaKey("failed to read RSA key file".into()))?;
+            return Self::from_pem(&pem);
+        }
+
+        if let Ok(pem_raw) = std::env::var(RSA_KEY_PEM_ENV) {
+            let pem = pem_raw.replace("\\n", "\n");
+            return Self::from_pem(&pem);
+        }
+
+        if let Ok(path) = std::env::var(RSA_KEY_PATH_ENV) {
+            let pem = std::fs::read_to_string(path)
+                .map_err(|_| CryptoError::RsaKey("failed to read RSA key file".into()))?;
+            return Self::from_pem(&pem);
+        }
+
+        Err(CryptoError::RsaKey(
+            "missing RSA key: set SHAIRPLAY_RSA_KEY_PEM or SHAIRPLAY_RSA_KEY_PATH".into(),
+        ))
     }
 
     /// Sign an Apple-Challenge for the `Apple-Response` RAOP auth header.
@@ -113,13 +150,98 @@ impl RsaKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding};
+    use rsa::rand_core::OsRng;
     use rsa::RsaPublicKey;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    const AIRPORT_KEY: &str = include_str!("../../airport.key");
+    fn unique_test_path(prefix: &str, suffix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}{suffix}", std::process::id()))
+    }
+
+    fn generate_test_pem() -> String {
+        let key = RsaPrivateKey::new(&mut OsRng, 2048).expect("test RSA key generation");
+        key.to_pkcs1_pem(LineEnding::LF)
+            .expect("encode test key to pkcs1 pem")
+            .to_string()
+    }
+
+    #[test]
+    fn from_env_loads_key_from_path_override() {
+        let pem = generate_test_pem();
+        let key_path = unique_test_path("shairplay-rsa", ".pem");
+        fs::write(&key_path, pem).expect("write key file");
+
+        let loaded = RsaKey::from_env(Some(&key_path));
+
+        let _ = fs::remove_file(&key_path);
+        assert!(loaded.is_ok(), "from_env should load key from explicit path");
+    }
+
+    #[test]
+    fn from_env_loads_key_after_dotenv_file_is_loaded() {
+        let pem = generate_test_pem();
+        let escaped_pem = pem.replace('\n', "\\n");
+        let dotenv_path = unique_test_path("shairplay-rsa", ".env");
+        fs::write(
+            &dotenv_path,
+            format!("{}=\"{}\"\n", RSA_KEY_PEM_ENV, escaped_pem),
+        )
+        .expect("write dotenv file");
+
+        dotenvy::from_filename_override(&dotenv_path).expect("load dotenv file");
+        let loaded = RsaKey::from_env(None);
+
+        let _ = fs::remove_file(&dotenv_path);
+        assert!(loaded.is_ok(), "from_env should load key from dotenv env var");
+    }
+
+    #[test]
+    fn from_env_none_returns_missing_key_error_when_vars_unset() {
+        let current_exe = std::env::current_exe().expect("resolve test binary path");
+        let output = Command::new(current_exe)
+            .arg("--exact")
+            .arg("from_env_none_returns_missing_key_error_when_vars_unset_helper")
+            .arg("--ignored")
+            .env_remove(RSA_KEY_PEM_ENV)
+            .env_remove(RSA_KEY_PATH_ENV)
+            .output()
+            .expect("spawn isolated test process");
+
+        assert!(
+            output.status.success(),
+            "isolated helper test failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "helper for isolated env-missing check"]
+    fn from_env_none_returns_missing_key_error_when_vars_unset_helper() {
+        let result = RsaKey::from_env(None);
+        match result {
+            Err(CryptoError::RsaKey(message)) => {
+                assert!(
+                    message.contains("missing RSA key"),
+                    "unexpected error message: {message}"
+                );
+            }
+            Ok(_) => panic!("expected missing-key error, got successful key load"),
+            Err(other) => panic!("expected CryptoError::RsaKey, got: {other}"),
+        }
+    }
 
     #[test]
     fn sign_challenge_rejects_invalid_lengths() {
-        let key = RsaKey::from_pem(AIRPORT_KEY).expect("airport.key valid");
+        let key = RsaKey::from_env(None).expect("RSA key from env valid");
         let challenge = B64.encode(b"abc");
 
         assert!(
@@ -134,7 +256,7 @@ mod tests {
 
     #[test]
     fn sign_challenge_accepts_ipv4_and_ipv6_lengths() {
-        let key = RsaKey::from_pem(AIRPORT_KEY).expect("airport.key valid");
+        let key = RsaKey::from_env(None).expect("RSA key from env valid");
         let challenge = B64.encode(b"abcd");
         let mac = [0, 1, 2, 3, 4, 5];
 
@@ -151,7 +273,7 @@ mod tests {
 
     #[test]
     fn decrypt_rejects_oversized_ciphertext() {
-        let key = RsaKey::from_pem(AIRPORT_KEY).expect("airport.key valid");
+        let key = RsaKey::from_env(None).expect("RSA key from env valid");
         // 1024 base64 chars decode to 768 bytes, far larger than the 256-byte
         // RSA-2048 modulus. Must return Err rather than panic copying into the
         // modulus-sized buffer.
@@ -161,7 +283,7 @@ mod tests {
 
     #[test]
     fn decrypt_roundtrip_oaep_sha1() {
-        let key = RsaKey::from_pem(AIRPORT_KEY).expect("airport.key valid");
+        let key = RsaKey::from_env(None).expect("RSA key from env valid");
         let public = RsaPublicKey::from(&key.key);
         let plaintext = b"0123456789abcdef";
         let ciphertext = public
@@ -179,13 +301,13 @@ mod tests {
 
     #[test]
     fn decrypt_rejects_invalid_base64() {
-        let key = RsaKey::from_pem(AIRPORT_KEY).expect("airport.key valid");
+        let key = RsaKey::from_env(None).expect("RSA key from env valid");
         assert!(key.decrypt("!!!").is_err());
     }
 
     #[test]
     fn decrypt_rejects_valid_b64_invalid_ciphertext() {
-        let key = RsaKey::from_pem(AIRPORT_KEY).expect("airport.key valid");
+        let key = RsaKey::from_env(None).expect("RSA key from env valid");
         // 16 zero bytes are valid base64-decoded data but not a valid OAEP block.
         let invalid = B64.encode([0u8; 16]);
         assert!(key.decrypt(&invalid).is_err());
